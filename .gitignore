@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+typst_output/
+extracted_figures/
+.pytest_cache/
+*.png
+*.pdf

@@ -8,9 +8,9 @@ description: >-
   storage directories, and compiles publication-grade PDFs via Typst.
 ---
 
-# Academic Paper Translator & Publication-Grade Typesetting
+# Academic Paper Translator & Publication-Grade Typesetting (V2 Verified Engine)
 
-Translate academic papers into publication-standard Chinese or sentence-by-sentence bilingual editions with high-fidelity formatting, original figure embedding, academic three-line tables (booktabs), and native vector equations.
+Translate academic papers into publication-standard Chinese or sentence-by-sentence bilingual editions with 100% sentence-level auditability, original figure embedding, academic three-line tables (booktabs), and native vector equations.
 
 ---
 
@@ -22,81 +22,142 @@ Translate academic papers into publication-standard Chinese or sentence-by-sente
    * **Mode B**: Full Chinese publication PDF & Markdown (纯中文出版级全译版).
    * **Mode C**: Paragraph-level bilingual (段落级交替对照).
    * **Mode D**: Dual-column parallel layout (左右双栏平行对照).
-3. **High-Resolution Figure Extraction & Embedding**: Automated cropping/extraction of all figures (diagrams, heatmaps, boxplots, trajectories, CDF curves) from the original PDF at 250+ DPI using PyMuPDF.
-4. **Three-Tier Academic Table Strategy**:
-   * *Quantitative Tables*: Kept in original English with full numerical accuracy and booktabs rules.
-   * *Qualitative Tables*: Translated into fluent academic Chinese.
-   * *Mixed Tables*: Variable names/acronyms preserved; explanatory text translated.
-5. **Vector Math Equations**: All formulas from Eq. (1) to end restored in LaTeX/Typst vector notation with unified numbering.
-6. **Zotero Storage Auto-Sync**: Automatically detects paper storage directory in Zotero (e.g. `E:\Document\Zotero\storage\<KEY>\`) and saves the resulting `.pdf` and `.md` deliverables directly into that folder.
+3. **Zero-Omission ID-Manifest Protocol**: Every extracted sentence, equation, table cell, and caption receives a deterministic unique ID (e.g. `sec01-p002-b005-s001`). Translation occurs strictly against this manifest, mathematically eliminating silent sentence drops.
+4. **Geometry-Aware Figure Extraction**: True graphic bounding box computation via PyMuPDF vector drawing paths and bitmap objects, preventing internal axis/legend text from truncating figures.
+5. **Two-Tier Quality Assurance Engine**:
+   * *Tier 1*: Source text layer coverage verification.
+   * *Tier 2*: Strict ID bijection, zero empty translations, numerical/unit preservation, and formula/citation invariance check.
+6. **Academic Three-Line Tables (Booktabs)**: Follows [table_guidelines.md](./references/table_guidelines.md) for full translation of descriptive text while preserving exact numerical matrices.
+7. **Vector Math Equations**: LaTeX/Typst vector notation with unified numbering.
+8. **Zotero Storage Auto-Sync**: Automatically detects paper storage directory in Zotero (e.g. `E:\Document\Zotero\storage\<KEY>\`) and saves deliverables directly into that folder.
 
 ---
 
-## Step-by-Step Translation Workflow
+## 4-Stage Verified Translation Pipeline
 
-### Phase 1: Input Analysis & Environment Setup
-1. **Locate Input Paper**:
-   * If user mentions a paper title or Zotero, check `E:\Document\Zotero\storage\` for matching item directory.
-   * Identify the source PDF or Markdown file.
-2. **Verify Tool Availability**:
-   * Ensure `typst` and `pymupdf` (fitz) are installed in Python (`pip install typst pymupdf`).
-3. **Extract Figures**:
-   * Run figure extraction script:
-     ```bash
-     python C:/Users/28048/.gemini/config/skills/academic-paper-translator/scripts/extract_paper.py "<path_to_pdf>" --out "paper_figures" --dpi 250
-     ```
+```
+  [Source PDF / TeX / MD]
+             │
+             ▼
+  ┌────────────────────────────────────────┐
+  │ Stage 1: Document Extraction & Manifest │  --> scripts/extract_document.py
+  │          (Generates source.jsonl)       │  --> scripts/extract_figures.py
+  └────────────────────────────────────────┘
+             │
+             ▼
+  ┌────────────────────────────────────────┐
+  │ Stage 2: ID-Bound Translation Dispatch │  --> Subagents translate by ID sets
+  │          (Zero-condensation mapping)   │  --> Returns {id: "translation"}
+  └────────────────────────────────────────┘
+             │
+             ▼
+  ┌────────────────────────────────────────┐
+  │ Stage 3: Two-Tier Audit & Verification  │  --> scripts/validate_translation.py
+  │          (100% ID coverage + invariants)│  --> Produces coverage_report.json
+  └────────────────────────────────────────┘
+             │ (Passes Audit)
+             ▼
+  ┌────────────────────────────────────────┐
+  │ Stage 4: Unified Post-Acceptance Typst  │  --> scripts/compile_typst.py
+  │          (Compiles publication PDF)    │  --> Mode A / B / C / D
+  └────────────────────────────────────────┘
+```
 
-### Phase 2: Translation & Academic Guidelines
-1. **Table Handling Rules**:
-   * Refer to [table_guidelines.md](./references/table_guidelines.md) for strict classification.
-   * Never round, truncate, or hallucinate numbers, standard errors, or p-values.
-2. **Citations & Bibliography**:
-   * Preserve all in-text citations like `(Teunissen, 1995)` and numerical markers like `[12]`.
-   * Omit the final `References` list from translated outputs unless explicitly requested.
-3. **Mathematical Formulas**:
-   * Preserve every symbol, Greek letter, sub/superscript, and matrix notation.
-   * In Typst, use `hat(a)` for $\hat{a}$, `caron(a)` for $\check{a}$, `mat(...)` for matrices, and avoid raw LaTeX backslashes inside `$ ... $`.
-4. **Sentence Alignment (for Bilingual Mode)**:
-   * Use [align_bilingual.py](./scripts/align_bilingual.py) to split English into sentences and pair each with its corresponding Chinese translation.
+---
 
-### Phase 3: Typst Typesetting & PDF Compilation
-1. **Apply Template**:
-   * Refer to [layout_templates.md](./references/layout_templates.md) for page margins, running headers, bilingual block macros (`bip`), headings (`h1`, `h2`), and table styling.
-2. **Windows Safe UTF-8 Encoding**:
-   * Always write files explicitly with `encoding='utf-8'` in Python to prevent Windows CP936/GBK code page corruption.
-3. **Compile to PDF**:
-   ```python
-   import typst
-   typst.compile("paper.typ", output="paper.pdf")
-   # Optional: generate page previews
-   typst.compile("paper.typ", output="preview_{p}.png", format="png", ppi=150)
+### Stage 1: Extraction & Manifest Generation
+
+1. **Extract Structured Manifest**:
+   ```bash
+   python scripts/extract_document.py "<path_to_paper.pdf>" --out "source.jsonl" --scope full
    ```
+   * `--scope full` (Default): Extracts title, abstract, sections, paragraphs, figure captions, tables, footnotes, and references.
+   * `--scope body`: Extracts body text only (omitting back-matter references).
 
-### Phase 4: Verification & Deployment
-1. **Quality Check**:
-   * Verify PDF total pages with `pypdf`.
-   * Verify font embedding and visual layout of page 1 and sample figure pages.
-2. **Deploy to Target Destination**:
-   * Copy the output `.pdf`, `.md`, and `paper_figures/` directly to the target destination (e.g., Zotero storage folder).
-3. **Clean Up Intermediate Artifacts**:
-   * Delete temporary scripts, text dumps, and intermediate PNG previews in the workspace.
+2. **Extract Figures with Graphic Geometry**:
+   ```bash
+   python scripts/extract_figures.py "<path_to_paper.pdf>" --out "paper_figures" --dpi 250
+   ```
+   * Computes graphic bounding box using vector path/image unions.
+   * Supports both standard (`Fig. 1`) and supplementary (`Fig. S1`) figures.
 
+---
 
-## Multi-Agent Collaborative Translation for Long Papers (长篇论文多Subagent并行协同翻译架构)
+### Stage 2: ID-Bound Translation Dispatching
 
-When handling comprehensive long papers (>10 pages / >8,000 words), relying on a single context window can risk unintended summarization or paragraph condensation. This skill incorporates a **Modular Multi-Subagent Pipeline**:
+Every translation unit is tied to its canonical `id`. The model or subagent must output a JSON dictionary or append to `translated.jsonl`:
 
-1. **Document Decomposition**:
-   - Master agent segments the raw PDF text into logical academic sections:
-     - sec1: Title, Abstract, Keywords, Section 1 Introduction
-     - sec2: Section 2 Mathematical Foundations & Principle
-     - sec3: Section 3 Methodology & Feature Engineering (Tables 1-2, Figs 1-7)
-     - sec4_1: Section 4.1 Benchmark Evaluation & Feature Importance (Tables 3-6, Figs 8-9)
-     - sec4_2: Section 4.2 RTK Positioning Performance (UGV, CAR, SmartPNT-POS, Tables 7-12, Figs 10-20)
-     - sec5: Section 5 Conclusions & Back Matter
-2. **Subagent Specialization**:
-   - Spawns parallel paper-translator subagents with role-specific system prompts.
-   - Each subagent extracts 100% verbatim sentences directly from PyMuPDF block streams, ensuring **zero condensation, zero omission, and zero paraphrasing**.
-3. **Cross-Agent Validation & Reassembly**:
-   - Master agent audits sentence counts and equation labels against original PDF block offsets.
-   - Reassembles bilingual (.typ, .md) and pure Chinese (.typ, .md) deliverables and compiles them via Typst.
+```json
+{
+  "id": "sec02-p003-b007-s002",
+  "kind": "sentence",
+  "section": "2.1 Problem Formulation",
+  "page": 3,
+  "source": "INS drifts over time.",
+  "translation": "惯性导航系统（INS）的定位误差会随时间累积并产生漂移。",
+  "status": "translated"
+}
+```
+
+#### Guidelines for Academic Chinese Translation:
+* **Accuracy over Form**: Retain all technical nuances, conditions, causes, and consequences.
+* **Citation Markers**: Preserve numerical citations `[1]`, `[1-3]` and author citations `(Teunissen, 1995)` verbatim.
+* **Math Formulas**: Keep symbols ($R$, $\sigma$, $\lambda$) in native math format; do not translate math variables into Chinese characters.
+* **Numbers & Units**: Never round, truncate, or hallucinate numbers (e.g. `0.25 m`, `95%`, `3.14 dB` must remain exact).
+
+---
+
+### Stage 3: Two-Tier Quality Assurance & Verification
+
+Before compiling any deliverable, execute the two-tier verification script:
+
+```bash
+python scripts/validate_translation.py --source "source.jsonl" --translated "translated.jsonl" --pdf "<path_to_paper.pdf>" --out "coverage_report.json"
+```
+
+The validator checks:
+1. **100% ID Bijection**: Missing IDs, duplicate IDs, or extra unmapped IDs cause an immediate audit failure (`FAIL_AUDIT`).
+2. **Zero Empty Translations**: No empty or whitespace-only translation strings.
+3. **Number & Unit Invariance**: Extracts all numbers, percentages, and physical units from source and asserts their exact presence in the translation.
+4. **Citation Invariance**: Asserts all bracketed and author-year citations are preserved.
+5. **Formula Numbering Invariance**: Asserts equation references (e.g. `(1)`, `Eq. (2)`) are preserved.
+
+If any invariant fails, fix the offending ID before proceeding to typesetting.
+
+---
+
+### Stage 4: Unified Post-Acceptance Typesetting (Typst)
+
+Once `coverage_report.json` reports `PASSED`, compile the final document:
+
+```bash
+# Mode A: Sentence-by-sentence Bilingual Interlinear (Recommended)
+python scripts/compile_typst.py "translated.jsonl" --mode A --out-pdf "paper_bilingual.pdf" --previews
+
+# Mode B: Full Academic Chinese Publication
+python scripts/compile_typst.py "translated.jsonl" --mode B --out-pdf "paper_chinese.pdf" --previews
+```
+
+Deploy the generated `.pdf`, `.typ`, and `paper_figures/` directly to target destinations (e.g. Zotero storage).
+
+---
+
+## Multi-Agent Collaborative Architecture for Long Papers
+
+For long papers (>10 pages / >8,000 words), use a generic, dynamic subagent partitioning protocol:
+
+1. **Section-Based Partitioning**:
+   The Master agent inspects `source.jsonl` and divides the item IDs into balanced partitions:
+   - `subagent_1`: Section 1 (Title, Abstract, Introduction) -> `ids=[sec01-...]`
+   - `subagent_2`: Section 2 (Theoretical Foundations & Mathematical Derivations) -> `ids=[sec02-...]`
+   - `subagent_3`: Section 3 (Methodology & Architecture) -> `ids=[sec03-...]`
+   - `subagent_4`: Section 4 (Experimental Results & Benchmark Evaluations) -> `ids=[sec04-...]`
+   - `subagent_5`: Section 5 (Discussion, Conclusion & Appendices) -> `ids=[sec05-...]`
+
+2. **Isolated Execution & Exact Return**:
+   Each subagent receives its assigned list of items and returns an exact ID-to-translation map.
+
+3. **Reassembly & Set-Theoretic Completeness**:
+   The Master agent verifies:
+   $$\bigcup_{k} \text{IDs}_k = \text{Manifest IDs}, \quad \text{IDs}_i \cap \text{IDs}_j = \emptyset \; (\forall i \neq j)$$
+   Once reassembled, the master agent runs `validate_translation.py` and compiles the final deliverables.
