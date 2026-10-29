@@ -85,7 +85,12 @@ class TestCodexRound3Fixes(unittest.TestCase):
             rows, _ = DocumentExtractor().extract(pdf_path)
             # 2. Extract figures
             fig_dir = os.path.join(td, "figures")
-            extract_figures(pdf_path, fig_dir, dpi=150)
+            figures = extract_figures(pdf_path, fig_dir, dpi=150)
+            # v3 requires an explicit resource connection; cwd discovery is no longer supported.
+            figure_one = next(f for f in figures if str(f['figure_id']) == '1')
+            for row in rows:
+                if row.get('kind') == 'figure':
+                    row['image_path'] = figure_one['image_path']
 
             # 3. Compile
             translated = [{**r, "translation": "图 1. 校准结果。", "status": "translated"} for r in rows]

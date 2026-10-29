@@ -1,733 +1,472 @@
 # -*- coding: utf-8 -*-
-"""
-Structured document extraction engine for academic papers (PDF, Markdown, LaTeX).
+"""Extract source units and a positional region ledger before any translation."""
+from __future__ import annotations
 
-Extracts structured content into a canonical `source.jsonl` manifest.
-Every item is assigned a stable, unique ID and conforms to the schema:
-{"id": str, "kind": str, "section": str, "page": int, "spans": list, "source": str, "status": "pending"}
-
-Supports configurable scope:
-  --scope full (default): all sections, figure captions, tables, footnotes, references.
-  --scope body: excludes references, footnotes, and back matter.
-"""
-
-import os
-import re
-import json
 import argparse
+import hashlib
+import inspect
+import json
+import re
+import sys
+from pathlib import Path
 import pymupdf
 
-
-# Regular expressions for structure identification
-FIGURE_CAPTION_REGEX = re.compile(
-    r'^(?:[\s\n]*)(?:Fig\.|Figure|Supplementary\s+Figure)[\s\u202f]*([A-Za-z0-9_.-]+)',
-    re.IGNORECASE
-)
-
-TABLE_CAPTION_REGEX = re.compile(
-    r'^(?:[\s\n]*)(?:Table|Tab\.)[\s\u202f]*([A-Za-z0-9_.-]+)',
-    re.IGNORECASE
-)
-
-SECTION_HEADING_REGEX = re.compile(
-    r'^(?:'
-    r'(?:[0-9]+(?:\.[0-9]+)*\.?|[A-Z]\.?)\s+[A-Z]|'
-    r'Abstract|Introduction|Related\s+Work|Methodology|Methods|Background|'
-    r'Architecture|Implementation|Experimental\s+Setup|Experiments|Results|'
-    r'Discussion|Conclusion|Conclusions|Acknowledge?ments?|References|Bibliography|Appendix'
-    r')',
-    re.IGNORECASE
-)
-
-REFERENCE_LINE_REGEX = re.compile(
-    r'^(?:\[\s*\d+\s*\]|\([A-Za-z]+,\s*(?:19|20)\d{2}\))\s+'
-)
-
-EQUATION_LINE_REGEX = re.compile(
-    r'(?:\(\s*([0-9]+[a-z]?)\s*\)|(?:Eq\.|Equation)\s*\(?([0-9]+[a-z]?)\)?)\s*$'
-)
-
 try:
-    from align_bilingual import split_en_sentences, split_zh_sentences
+    from .align_bilingual import split_en_sentences
+    from .backends.common import normalize_with_map, sentence_ranges, scoped_out
 except ImportError:
+    from align_bilingual import split_en_sentences
+    from backends.common import normalize_with_map, sentence_ranges, scoped_out
+
+FIGURE_CAPTION_REGEX = re.compile(r'^(?:Fig\.|Figure|Supplementary\s+Figure)\s*([A-Za-z0-9_.-]+)', re.I)
+TABLE_CAPTION_REGEX = re.compile(r'^(?:Table|Tab\.)\s*([A-Za-z0-9_.-]+)', re.I)
+SECTION_HEADING_REGEX = re.compile(r'^(?:[0-9]+(?:\.[0-9]+)*\.?\s+[A-Z]|[A-Z]\.\s+[A-Z]|Abstract|Introduction|Related\s+Work|Method|Background|Results|Discussion|Conclusion|Acknowledg|References|Bibliography|Appendix)', re.I)
+REFERENCE_LINE_REGEX = re.compile(r'^\[\s*\d+\s*\]\s+')
+EQUATION_LINE_REGEX = re.compile(r'\(\s*([0-9]+[a-z]?)\s*\)\s*$')
+
+
+def clean_text(text):
+    return normalize_with_map(text or '')[0]
+
+
+def sanitize_id_part(text):
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', text.strip()) or '001'
+
+
+def _sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _load_assets(path, doc_id):
     try:
-        from scripts.align_bilingual import split_en_sentences, split_zh_sentences
+        from .document_ir import read_json
     except ImportError:
-        # Fallback if neither is found
-        def split_en_sentences(text: str) -> list[str]:
-            return [s.strip() for s in re.split(r'(?<=[.?!])\s+', text) if s.strip()]
-        def split_zh_sentences(text: str) -> list[str]:
-            return [s.strip() for s in re.split(r'(?<=[。！？])\s*', text) if s.strip()]
-
-
-def clean_text(text: str) -> str:
-    """Collapses whitespace while preserving single spaces."""
-    if not text:
-        return ""
-    return re.sub(r'\s+', ' ', text).strip()
-
-
-def sanitize_id_part(text: str) -> str:
-    """Creates a filesystem and manifest safe identifier string."""
-    clean = re.sub(r'[^A-Za-z0-9_.-]', '_', text.strip())
-    return clean if clean else "001"
+        from document_ir import read_json
+    data = read_json(path)
+    assets = data.get('assets', []) if isinstance(data, dict) else data
+    if not isinstance(assets, list):
+        raise ValueError('Asset manifest must be a list or an object containing assets')
+    seen, result = set(), []
+    for original in assets:
+        item = dict(original)
+        if item.get('doc_id') != doc_id:
+            raise ValueError('Asset belongs to a different or unspecified document')
+        key = item.get('asset_id')
+        if not key or key in seen:
+            raise ValueError('Missing or duplicate asset_id')
+        seen.add(key)
+        raw_path = item.get('path') or item.get('image_path')
+        if not raw_path:
+            raise ValueError(f'Missing path for asset {key}')
+        image = Path(raw_path)
+        if not image.is_absolute():
+            image = Path(path).resolve().parent / image
+        if not image.is_file() or _sha(image) != item.get('sha256'):
+            raise ValueError(f'Missing or modified asset {key}')
+        item.update(path=str(image.resolve()), image_path=str(image.resolve()))
+        result.append(item)
+    return result
 
 
 class DocumentExtractor:
-    """Structured academic document extraction engine."""
+    def __init__(self, scope='full', assets_manifest=None, asset_dir=None,
+                 backend='native', mineru_result=None, main_file=None, source_overlay=None):
+        if scope not in ('full', 'body'):
+            raise ValueError(f'Invalid scope: {scope}')
+        self.scope = scope
+        self.assets_manifest = assets_manifest
+        self.asset_dir = Path(asset_dir).resolve() if asset_dir else None
+        self.backend = backend
+        self.mineru_result = mineru_result
+        self.main_file = main_file
+        self.source_overlay = source_overlay
+        self.regions, self.assets, self.warnings = [], [], []
+        self.extra_document = {}
 
-    def __init__(self, scope: str = "full"):
-        self.scope = scope.lower()
-        if self.scope not in ("full", "body"):
-            raise ValueError(f"Invalid scope '{scope}'. Must be 'full' or 'body'.")
-
-    def extract(self, input_path: str) -> tuple[list[dict], dict]:
-        """
-        Extracts structured content from PDF, Markdown, or LaTeX.
-        Returns (items, summary_stats).
-        """
-        if not os.path.isfile(input_path):
-            raise FileNotFoundError(f"Input file not found: {input_path}")
-
-        ext = os.path.splitext(input_path)[1].lower()
-        if ext == ".pdf":
-            items = self._extract_pdf(input_path)
-            total_pages = self._get_pdf_page_count(input_path)
-        elif ext in (".md", ".markdown"):
-            items = self._extract_markdown(input_path)
+    def extract(self, input_path):
+        path = Path(input_path).resolve()
+        if not path.exists():
+            raise FileNotFoundError(path)
+        self.regions, self.assets, self.warnings = [], [], []
+        self.extra_document = {}
+        suffix = path.suffix.lower()
+        if path.is_dir() or suffix in ('.tex', '.latex'):
+            try:
+                from .backends.latex_backend import extract_project
+            except ImportError:
+                from backends.latex_backend import extract_project
+            parsed = extract_project(path, main_file=self.main_file)
+            items = parsed['items']
+            self._adopt(parsed)
             total_pages = 1
-        elif ext in (".tex", ".latex"):
-            items = self._extract_latex(input_path)
+        elif suffix == '.pdf':
+            if self.backend == 'mineru':
+                try:
+                    from .backends.mineru_backend import extract_mineru
+                except ImportError:
+                    from backends.mineru_backend import extract_mineru
+                parsed = extract_mineru(path, result_path=self.mineru_result)
+                items = parsed['items']
+                self._adopt(parsed)
+                total_pages = parsed['pages']
+            else:
+                items = self._extract_pdf(path)
+                with pymupdf.open(path) as doc:
+                    total_pages = len(doc)
+                self.extra_document.update(extractor={'name': 'pymupdf', 'version': pymupdf.VersionBind},
+                                           source_format='pdf', processed_pages=list(range(1, total_pages + 1)))
+                table_signature = inspect.signature(pymupdf.table.find_tables).parameters
+                layout_parameter = table_signature.get('use_layout')
+                self.extra_document['table_detection'] = {
+                    'method': 'pymupdf.Page.find_tables',
+                    'use_layout_default': layout_parameter.default if layout_parameter else 'not available in this version',
+                    'failure_policy': 'NEEDS_REVIEW; no silent fallback to incomplete tables',
+                }
+        elif suffix in ('.md', '.markdown'):
+            try:
+                from .backends.markdown_backend import extract_markdown
+            except ImportError:
+                from backends.markdown_backend import extract_markdown
+            parsed = extract_markdown(path)
+            items = parsed['items']
+            self._adopt(parsed)
             total_pages = 1
         else:
-            raise ValueError(f"Unsupported file format '{ext}'. Must be PDF (.pdf), Markdown (.md), or LaTeX (.tex).")
-
-        # Apply scope filtering if scope == 'body'
-        if self.scope == "body":
-            filtered_items = []
-            for item in items:
-                sec_lower = item["section"].lower()
-                kind = item["kind"]
-                if kind in ("reference", "footnote"):
-                    continue
-                if "reference" in sec_lower or "bibliography" in sec_lower or "acknowledgement" in sec_lower:
-                    if kind != "heading":
-                        continue
-                filtered_items.append(item)
-            items = filtered_items
-
+            raise ValueError('Supported inputs: PDF, Markdown, .tex, or a LaTeX project directory')
+        if self.source_overlay:
+            if suffix != '.pdf':
+                raise ValueError('Manual source overlays currently support PDF regions only')
+            try:
+                from .backends.manual_overlay import apply_overlay
+            except ImportError:
+                from backends.manual_overlay import apply_overlay
+            self.warnings, overlay_info = apply_overlay(path, self.source_overlay, items, self.regions, self.assets, self.warnings)
+            self.extra_document['source_overlay'] = overlay_info
+        if suffix == '.pdf':
+            try:
+                from .backends.pdf_order import order_pdf_units
+            except ImportError:
+                from backends.pdf_order import order_pdf_units
+            items = order_pdf_units(items, self.assets)
+            try:
+                from .backends.pdf_structure import merge_hanging_references, merge_page_continuations, normalize_line_wraps
+            except ImportError:
+                from backends.pdf_structure import merge_hanging_references, merge_page_continuations, normalize_line_wraps
+            items = merge_hanging_references(items, self.regions)
+            items = merge_page_continuations(items, self.regions)
+            items = normalize_line_wraps(items, self.regions)
+            self.extra_document['reading_order_method'] = 'geometry: paragraph/table/figure groups; two-column bands when both columns are detected; requires source visual review'
+        ids = [i['id'] for i in items]
+        if len(ids) != len(set(ids)):
+            raise ValueError('Extractor generated duplicate source IDs')
+        excluded = [i for i in items if self.scope == 'body' and scoped_out(i)]
+        excluded_ids = {i['id'] for i in excluded}
+        for region in self.regions:
+            owners = region.get('unit_ids', [])
+            if owners and all(i in excluded_ids for i in owners):
+                region['disposition'] = 'excluded'
+                region['evidence'] = {'rule': 'scope=body', 'reason': 'References, footnotes, acknowledgements and appendices excluded'}
+        items = [i for i in items if i['id'] not in excluded_ids]
+        for order, item in enumerate(items):
+            item.setdefault('status', 'pending')
+            item.setdefault('action', 'preserve' if item['kind'] in ('equation', 'code') or not item.get('source', '').strip() else 'translate')
+            item.setdefault('parent_id', item['id'])
+            item.setdefault('section_path', [item.get('section', '')])
+            item.setdefault('spans', [])
+            item['order'] = order
+        self.extra_document['extraction_warnings'] = self.warnings
+        self.extra_document['excluded_items'] = [{'id': i['id'], 'kind': i['kind'], 'source': i['source'], 'locators': i.get('locators', []), 'reason': 'scope=body'} for i in excluded]
         stats = self._compute_summary(items, total_pages)
+        stats.update(warnings=self.warnings, excluded_items=len(excluded), backend=self.backend,
+                     excluded_regions=sum(r.get('disposition') == 'excluded' for r in self.regions),
+                     running_matter_regions=sum(r.get('role') == 'running_matter' for r in self.regions),
+                     extraction_status='NEEDS_REVIEW' if self.warnings else 'PASS')
         return items, stats
 
-    def _get_pdf_page_count(self, pdf_path: str) -> int:
+    def _adopt(self, result):
+        self.regions = result.get('regions', [])
+        self.assets = result.get('assets', [])
+        self.warnings = result.get('warnings', [])
+        self.extra_document = result.get('document', {})
+
+    def _extract_markdown(self, path):
+        from importlib import import_module
+        module = import_module(f'{__package__}.backends.markdown_backend' if __package__ else 'backends.markdown_backend')
+        result = module.extract_markdown(path)
+        self._adopt(result)
+        return result['items']
+
+    def _extract_latex(self, path):
+        from importlib import import_module
+        module = import_module(f'{__package__}.backends.latex_backend' if __package__ else 'backends.latex_backend')
+        result = module.extract_project(path, main_file=self.main_file)
+        self._adopt(result)
+        return result['items']
+
+    def _extract_pdf(self, pdf_path):
+        doc_id = _sha(pdf_path)
+        if self.assets_manifest:
+            self.assets = _load_assets(self.assets_manifest, doc_id)
+        elif self.asset_dir:
+            try:
+                from .extract_figures import extract_figures
+            except ImportError:
+                from extract_figures import extract_figures
+            self.assets = extract_figures(str(pdf_path), str(self.asset_dir), dpi=250)
+        items, figure_counts = [], {}
+        section, sec_idx, ref_idx = 'Title & Abstract', 0, 0
         try:
-            doc = pymupdf.open(pdf_path)
-            return len(doc)
-        except Exception:
-            return 1
-
-    def _extract_pdf(self, pdf_path: str) -> list[dict]:
-        doc = pymupdf.open(pdf_path)
-        items = []
-
-        current_sec_title = "Title & Abstract"
-        sec_idx = 0
-        ref_counter = 0
-        eq_counter = 0
-        sections_seen = {current_sec_title}
-
-        # Auto-discover figure manifest if available
-        fig_image_map = {}
-        pdf_dir = os.path.dirname(os.path.abspath(pdf_path))
-        candidate_manifest_dirs = [
-            os.path.join(pdf_dir, "paper_figures"),
-            os.path.join(pdf_dir, "figures"),
-            os.path.join(pdf_dir, "column-figures"),
-            pdf_dir,
-            "paper_figures",
-            "figures",
-            "column-figures",
-            "."
-        ]
-        # Also check directories in pdf_dir or cwd containing 'figure'
-        for search_dir in [pdf_dir, "."]:
-            try:
-                for entry in os.listdir(search_dir):
-                    full_p = os.path.join(search_dir, entry)
-                    if os.path.isdir(full_p) and "figure" in entry.lower() and full_p not in candidate_manifest_dirs:
-                        candidate_manifest_dirs.append(full_p)
-            except Exception:
-                pass
-
-        for c_dir in candidate_manifest_dirs:
-            mf_file = os.path.join(c_dir, "figures_manifest.json")
-            if os.path.isfile(mf_file):
+            from .backends.pdf_structure import refine_table, repeated_running_matter
+        except ImportError:
+            from backends.pdf_structure import refine_table, repeated_running_matter
+        with pymupdf.open(pdf_path) as doc:
+            running_matter = repeated_running_matter(doc)
+            for page_idx, page in enumerate(doc):
+                page_no = page_idx + 1
+                page_meta = {'page': page_no, 'width': page.rect.width, 'height': page.rect.height,
+                             'rotation': page.rotation, 'coordinate_system': 'unrotated_top_left_pt'}
+                tables = []
                 try:
-                    with open(mf_file, "r", encoding="utf-8") as f:
-                        f_list = json.load(f)
-                        for f_ent in f_list:
-                            f_id = str(f_ent.get("figure_id", ""))
-                            img_p = f_ent.get("image_path", "")
-                            if f_id and img_p and os.path.isfile(img_p):
-                                fig_image_map[f_id] = img_p
-                except Exception:
-                    pass
-            if fig_image_map:
-                break
-
-        for pno, page in enumerate(doc):
-            page_num = pno + 1
-            # 1. First extract native tables if any
-            extracted_tables = []
-            try:
-                tabs = page.find_tables()
-                for t_idx, tab in enumerate(tabs.tables):
-                    tbl_id = f"p{page_num}-tbl{t_idx + 1}"
-                    table_cells = tab.extract()
-                    # Add table cell items
-                    for r_idx, row in enumerate(table_cells):
-                        for c_idx, cell_text in enumerate(row):
-                            val = clean_text(cell_text) if cell_text else ""
-                            if val:
-                                cell_id = f"{tbl_id}-cell-r{r_idx + 1}c{c_idx + 1}"
-                                items.append({
-                                    "id": cell_id,
-                                    "kind": "table_cell",
-                                    "table_id": tbl_id,
-                                    "section": current_sec_title,
-                                    "page": page_num,
-                                    "row": r_idx,
-                                    "col": c_idx,
-                                    "spans": [{"bbox": list(tab.bbox)}],
-                                    "source": val,
-                                    "status": "pending"
-                                })
-                    extracted_tables.append(pymupdf.Rect(tab.bbox))
-            except Exception:
-                pass
-
-            # 2. Extract text blocks and spans
-            text_dict = page.get_text("dict")
-            blocks = text_dict.get("blocks", [])
-
-            for b_idx, block in enumerate(blocks):
-                # Ignore raster image blocks
-                if block.get("type") != 0:
-                    continue
-
-                block_rect = pymupdf.Rect(block.get("bbox", [0, 0, 0, 0]))
-                lines = block.get("lines", [])
-                block_text_parts = []
-                spans_meta = []
-
-                for line in lines:
-                    line_spans = line.get("spans", [])
-                    line_text = ""
-                    for sp in line_spans:
-                        text = sp.get("text", "")
-                        line_text += text
-                        spans_meta.append({
-                            "bbox": [round(c, 2) for c in sp.get("bbox", [0, 0, 0, 0])],
-                            "font": sp.get("font", ""),
-                            "size": round(sp.get("size", 10.0), 1),
-                            "flags": sp.get("flags", 0)
-                        })
-                    block_text_parts.append(line_text)
-
-                raw_block_text = " ".join(block_text_parts).strip()
-                if not raw_block_text:
-                    continue
-
-                # Skip if block substantially overlaps with an already extracted table
-                is_inside_table = any(
-                    (block_rect & tbl_rect).get_area() > 0.35 * block_rect.get_area() or
-                    (block_rect & tbl_rect).get_area() > 0.35 * tbl_rect.get_area()
-                    for tbl_rect in extracted_tables
-                )
-                if is_inside_table:
-                    continue
-
-                # Determine if block is a Section Heading
-                is_heading = False
-                max_font_size = max((s["size"] for s in spans_meta), default=10.0)
-                is_bold = any(s["flags"] & 2 != 0 or "bold" in s["font"].lower() for s in spans_meta)
-
-                if (max_font_size >= 11.5 or (is_bold and max_font_size >= 10.0)) and len(raw_block_text) < 120:
-                    if SECTION_HEADING_REGEX.search(raw_block_text):
-                        is_heading = True
-
-                if is_heading:
-                    sec_idx += 1
-                    current_sec_title = clean_text(raw_block_text)
-                    sections_seen.add(current_sec_title)
-                    heading_id = f"sec{sec_idx:02d}-head"
-                    items.append({
-                        "id": heading_id,
-                        "kind": "heading",
-                        "section": current_sec_title,
-                        "page": page_num,
-                        "spans": spans_meta,
-                        "source": current_sec_title,
-                        "status": "pending"
-                    })
-                    continue
-
-                # Check for Figure Caption
-                fig_match = FIGURE_CAPTION_REGEX.search(raw_block_text)
-                if fig_match and (fig_match.start() < 10 or FIGURE_CAPTION_REGEX.match(raw_block_text)):
-                    fig_id = sanitize_id_part(fig_match.group(1).rstrip(".:,;-"))
-                    items.append({
-                        "id": f"fig-{fig_id}-cap",
-                        "kind": "figure",
-                        "figure_no": fig_id,
-                        "image_path": fig_image_map.get(fig_id, ""),
-                        "section": current_sec_title,
-                        "page": page_num,
-                        "spans": spans_meta,
-                        "source": clean_text(raw_block_text),
-                        "status": "pending"
-                    })
-                    continue
-
-                # Check for Table Caption
-                tbl_match = TABLE_CAPTION_REGEX.search(raw_block_text)
-                if tbl_match and (tbl_match.start() < 10 or TABLE_CAPTION_REGEX.match(raw_block_text)):
-                    tbl_id = sanitize_id_part(tbl_match.group(1).rstrip(".:,;-"))
-                    items.append({
-                        "id": f"tbl-{tbl_id}-cap",
-                        "kind": "table",
-                        "section": current_sec_title,
-                        "page": page_num,
-                        "spans": spans_meta,
-                        "source": clean_text(raw_block_text),
-                        "status": "pending"
-                    })
-                    continue
-
-                # Check for Reference item
-                is_ref_sec = "reference" in current_sec_title.lower() or "bibliography" in current_sec_title.lower()
-                if is_ref_sec or REFERENCE_LINE_REGEX.match(raw_block_text):
-                    ref_counter += 1
-                    items.append({
-                        "id": f"ref-{ref_counter:03d}",
-                        "kind": "reference",
-                        "section": current_sec_title,
-                        "page": page_num,
-                        "spans": spans_meta,
-                        "source": clean_text(raw_block_text),
-                        "status": "pending"
-                    })
-                    continue
-
-                # Check for Standalone Display Equation
-                eq_match = EQUATION_LINE_REGEX.search(raw_block_text)
-                if eq_match and len(raw_block_text) < 150:
-                    eq_counter += 1
-                    eq_label = eq_match.group(1) or eq_match.group(2) or str(eq_counter)
-                    items.append({
-                        "id": f"eq-{sanitize_id_part(eq_label)}",
-                        "kind": "equation",
-                        "section": current_sec_title,
-                        "page": page_num,
-                        "spans": spans_meta,
-                        "source": clean_text(raw_block_text),
-                        "status": "pending"
-                    })
-                    continue
-
-                # Regular Body Sentences
-                sentences = split_en_sentences(raw_block_text)
-                for s_idx, sent in enumerate(sentences):
-                    s_id = f"sec{sec_idx:02d}-p{page_num:03d}-b{b_idx + 1:03d}-s{s_idx + 1:03d}"
-                    items.append({
-                        "id": s_id,
-                        "kind": "sentence",
-                        "section": current_sec_title,
-                        "page": page_num,
-                        "spans": spans_meta,
-                        "source": sent,
-                        "status": "pending"
-                    })
-
-        return items
-
-    def _extract_markdown(self, md_path: str) -> list[dict]:
-        with open(md_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        items = []
-        current_sec_title = "Title & Abstract"
-        sec_idx = 0
-        ref_counter = 0
-        eq_counter = 0
-        b_idx = 0
-
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if not line:
-                i += 1
-                continue
-
-            # Heading
-            if line.startswith("#"):
-                sec_idx += 1
-                heading_text = line.lstrip("#").strip()
-                current_sec_title = heading_text
-                items.append({
-                    "id": f"sec{sec_idx:02d}-head",
-                    "kind": "heading",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": heading_text,
-                    "status": "pending"
-                })
-                i += 1
-                continue
-
-            # Equation block ($$ ... $$)
-            if line.startswith("$$"):
-                eq_counter += 1
-                eq_lines = [line]
-                if not line.endswith("$$") or line == "$$":
-                    i += 1
-                    while i < len(lines) and not lines[i].strip().endswith("$$"):
-                        eq_lines.append(lines[i].strip())
-                        i += 1
-                    if i < len(lines):
-                        eq_lines.append(lines[i].strip())
-                eq_text = "\n".join(eq_lines)
-                items.append({
-                    "id": f"eq-{eq_counter:03d}",
-                    "kind": "equation",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": eq_text,
-                    "status": "pending"
-                })
-                i += 1
-                continue
-
-            # Table row or Markdown Table
-            if line.startswith("|") and line.endswith("|"):
-                tbl_lines = [line]
-                i += 1
-                while i < len(lines) and lines[i].strip().startswith("|"):
-                    tbl_lines.append(lines[i].strip())
-                    i += 1
-                items.append({
-                    "id": f"tbl-{b_idx + 1:03d}",
-                    "kind": "table",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": "\n".join(tbl_lines),
-                    "status": "pending"
-                })
-                continue
-
-            # Figure caption / image
-            fig_match = FIGURE_CAPTION_REGEX.search(line)
-            if fig_match or line.startswith("!["):
-                fig_id = sanitize_id_part(fig_match.group(1).rstrip(".:,;-")) if fig_match else f"{b_idx + 1:03d}"
-                items.append({
-                    "id": f"fig-{fig_id}-cap",
-                    "kind": "figure",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": line,
-                    "status": "pending"
-                })
-                i += 1
-                continue
-
-            # Reference entry
-            is_ref_sec = "reference" in current_sec_title.lower() or "bibliography" in current_sec_title.lower()
-            if is_ref_sec or REFERENCE_LINE_REGEX.match(line):
-                ref_counter += 1
-                items.append({
-                    "id": f"ref-{ref_counter:03d}",
-                    "kind": "reference",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": line,
-                    "status": "pending"
-                })
-                i += 1
-                continue
-
-            # Paragraph block
-            b_idx += 1
-            para_lines = [line]
-            i += 1
-            while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith(("#", "$$", "|", "![")):
-                para_lines.append(lines[i].strip())
-                i += 1
-            para_text = " ".join(para_lines)
-
-            sentences = split_en_sentences(para_text)
-            for s_idx, sent in enumerate(sentences):
-                s_id = f"sec{sec_idx:02d}-p001-b{b_idx:03d}-s{s_idx + 1:03d}"
-                items.append({
-                    "id": s_id,
-                    "kind": "sentence",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": sent,
-                    "status": "pending"
-                })
-
-        return items
-
-    def _extract_latex(self, tex_path: str) -> list[dict]:
-        with open(tex_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        items = []
-        current_sec_title = "Title & Abstract"
-        sec_idx = 0
-        ref_counter = 0
-        eq_counter = 0
-        b_idx = 0
-
-        # Remove LaTeX comments
-        clean_content = re.sub(r'(?<!\\)%.*$', '', content, flags=re.MULTILINE)
-        # Ensure section commands are isolated by newlines
-        clean_content = re.sub(r'(\\(?:sub)*section\*?\{[^}]+\})', r'\n\n\1\n\n', clean_content)
-
-        # Split into blocks or paragraphs
-        raw_paras = clean_content.split("\n\n")
-
-        for p_raw in raw_paras:
-            p = p_raw.strip()
-            # Remove LaTeX preamble / document boundaries
-            p = re.sub(r'\\(?:documentclass|usepackage|begin\{document\}|end\{document\})(?:\[[^\]]*\])?(?:\{[^}]*\})?', '', p).strip()
-            if not p:
-                continue
-
-            # Section headings
-            sec_m = re.search(r'\\(?:sub)*section\*?\{([^}]+)\}', p)
-            if sec_m:
-                sec_idx += 1
-                current_sec_title = sec_m.group(1).strip()
-                items.append({
-                    "id": f"sec{sec_idx:02d}-head",
-                    "kind": "heading",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": current_sec_title,
-                    "status": "pending"
-                })
-                continue
-
-            # Equations
-            if "\\begin{equation}" in p or "\\begin{align}" in p or "$$" in p:
-                eq_counter += 1
-                items.append({
-                    "id": f"eq-{eq_counter:03d}",
-                    "kind": "equation",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": p,
-                    "status": "pending"
-                })
-                continue
-
-            # Figures
-            if "\\begin{figure}" in p:
-                cap_m = re.search(r'\\caption\{([^}]+)\}', p)
-                cap_text = cap_m.group(1).strip() if cap_m else p
-                fig_m = FIGURE_CAPTION_REGEX.search(cap_text)
-                fig_id = sanitize_id_part(fig_m.group(1).rstrip(".:,;-")) if fig_m else f"{b_idx + 1:03d}"
-                items.append({
-                    "id": f"fig-{fig_id}-cap",
-                    "kind": "figure",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": cap_text,
-                    "status": "pending"
-                })
-                continue
-
-            # Tables
-            if "\\begin{table}" in p or "\\begin{tabular}" in p:
-                cap_m = re.search(r'\\caption\{([^}]+)\}', p)
-                cap_text = cap_m.group(1).strip() if cap_m else "Table"
-                tbl_m = TABLE_CAPTION_REGEX.search(cap_text)
-                tbl_id = sanitize_id_part(tbl_m.group(1).rstrip(".:,;-")) if tbl_m else f"{b_idx + 1:03d}"
-                items.append({
-                    "id": f"tbl-{tbl_id}-cap",
-                    "kind": "table",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": cap_text,
-                    "status": "pending"
-                })
-
-                # Extract tabular body rows and cells if present
-                tabular_m = re.search(r'\\begin\{tabular\}\{[^}]*\}(.*?)\\end\{tabular\}', p, re.DOTALL)
-                if tabular_m:
-                    tab_content = tabular_m.group(1).strip()
-                    raw_rows = [r.strip() for r in tab_content.split(r'\\') if r.strip()]
-                    cell_r = 0
-                    for r_str in raw_rows:
-                        clean_r = re.sub(r'\\(hline|toprule|midrule|bottomrule)', '', r_str).strip()
-                        if not clean_r:
-                            continue
-                        cells = [c.strip() for c in clean_r.split('&')]
-                        for c_idx, cell_text in enumerate(cells):
-                            clean_cell = re.sub(r'\\text(?:bf|it|rm|sf)\{([^}]+)\}', r'\1', cell_text).strip()
-                            clean_cell = clean_text(clean_cell)
-                            if clean_cell:
-                                items.append({
-                                    "id": f"tbl-{tbl_id}-cell-r{cell_r + 1}c{c_idx + 1}",
-                                    "kind": "table_cell",
-                                    "table_id": f"tbl-{tbl_id}",
-                                    "section": current_sec_title,
-                                    "page": 1,
-                                    "row": cell_r,
-                                    "col": c_idx,
-                                    "spans": [],
-                                    "source": clean_cell,
-                                    "status": "pending"
-                                })
-                        cell_r += 1
-                continue
-
-            # Bibitem
-            if "\\bibitem" in p:
-                for line in p.split("\n"):
-                    line = line.strip()
-                    if line.startswith("\\bibitem"):
-                        ref_counter += 1
-                        items.append({
-                            "id": f"ref-{ref_counter:03d}",
-                            "kind": "reference",
-                            "section": current_sec_title,
-                            "page": 1,
-                            "spans": [],
-                            "source": line,
-                            "status": "pending"
-                        })
-                continue
-
-            # Regular body paragraph
-            b_idx += 1
-            # Strip LaTeX commands like \textbf{}, \cite{}, etc. for plain sentences
-            plain_para = re.sub(r'\\[a-zA-Z]+\*?(?:\[[^\]]*\])?\{([^}]*)\}', r'\1', p)
-            sentences = split_en_sentences(plain_para)
-            for s_idx, sent in enumerate(sentences):
-                s_id = f"sec{sec_idx:02d}-p001-b{b_idx:03d}-s{s_idx + 1:03d}"
-                items.append({
-                    "id": s_id,
-                    "kind": "sentence",
-                    "section": current_sec_title,
-                    "page": 1,
-                    "spans": [],
-                    "source": sent,
-                    "status": "pending"
-                })
-
-        return items
-
-    def _compute_summary(self, items: list[dict], total_pages: int) -> dict:
-        sections = set()
-        sentence_count = 0
-        figure_count = 0
-        table_count = 0
-        reference_count = 0
-        equation_count = 0
-
+                    tables = list(page.find_tables().tables)
+                except Exception as exc:
+                    self.warnings.append({'code': 'table_detection_failed', 'page': page_no, 'message': str(exc)})
+                table_info = []
+                for index, table in enumerate(tables):
+                    table_id = f'p{page_no}-tbl{index + 1}'
+                    cell_specs, table_rect, table_warnings = refine_table(table, page, table_id)
+                    self.warnings.extend({**warning, 'page': page_no} for warning in table_warnings)
+                    cell_items = []
+                    for cell in cell_specs:
+                        row_no, col_no = cell['row'], cell['col']
+                        bbox = cell['bbox']
+                        cell_id = f'{table_id}-cell-r{row_no + 1}c{col_no + 1}'
+                        raw = cell['source']
+                        normalized, mapping = normalize_with_map(raw)
+                        region_id = f'p{page_no}:table{index + 1}:r{row_no}c{col_no}'
+                        locator = {**page_meta, 'region_id': region_id, 'bbox': bbox, 'start': 0, 'end': len(raw)}
+                        item = {**cell, 'id': cell_id, 'kind': 'table_cell', 'table_id': table_id, 'parent_id': table_id,
+                                'section': section, 'page': page_no, 'spans': [{'bbox': bbox}], 'locators': [locator],
+                                'source': normalized, 'raw_source': raw, 'normalization_map': mapping,
+                                'action': 'translate' if normalized else 'preserve', 'empty_cell': not normalized, 'status': 'pending'}
+                        item.pop('bbox', None)
+                        cell_items.append(item)
+                        self.regions.append({'region_id': region_id, 'locator': locator, 'role': 'table_cell',
+                                             'raw_text': raw, 'disposition': item['action'], 'unit_ids': [cell_id]})
+                    items.extend(cell_items)
+                    table_info.append((table_id, table_rect, cell_items))
+                blocks = page.get_text('dict').get('blocks', [])
+                for block_index, block in enumerate(blocks):
+                    bbox = list(block.get('bbox', (0, 0, 0, 0)))
+                    block_id = block.get('number', block_index)
+                    region_id = f'p{page_no}:b{block_id}'
+                    locator = {**page_meta, 'block_id': block_id, 'region_id': region_id, 'bbox': bbox}
+                    if block.get('type') != 0:
+                        bound_assets = [a for a in self.assets if a.get('page') == page_no and pymupdf.Rect(a['bbox']).contains(pymupdf.Rect(bbox))]
+                        region = {'region_id': region_id, 'locator': locator, 'role': 'image', 'raw_text': '',
+                                  'disposition': 'needs_review', 'unit_ids': [], 'asset_ids': [a['asset_id'] for a in bound_assets],
+                                  'evidence': {'reason': 'Image text cannot be verified by native extraction'}}
+                        self.regions.append(region)
+                        area = pymupdf.Rect(bbox).get_area() / max(page.rect.get_area(), 1)
+                        self.warnings.append({'code': 'image_text_unverified', 'page': page_no, 'region_id': region_id,
+                                              'bbox': bbox, 'area_fraction': area, 'message': 'OCR or source visual review required, even when native page headers exist'})
+                        continue
+                    spans, pieces = [], []
+                    cursor = 0
+                    for line_index, line in enumerate(block.get('lines', [])):
+                        if pieces:
+                            pieces.append('\n')
+                            cursor += 1
+                        for span_index, span in enumerate(line.get('spans', [])):
+                            text = span.get('text', '')
+                            spans.append({'span_id': f'{region_id}:l{line_index}:s{span_index}', 'bbox': list(span.get('bbox', bbox)),
+                                          'font': span.get('font', ''), 'size': span.get('size', 10), 'flags': span.get('flags', 0),
+                                          'text': text, 'start': cursor, 'end': cursor + len(text)})
+                            pieces.append(text)
+                            cursor += len(text)
+                    raw = ''.join(pieces)
+                    if not raw.strip():
+                        continue
+                    locator.update(start=0, end=len(raw))
+                    normalized, mapping = normalize_with_map(raw)
+                    region = {'region_id': region_id, 'locator': locator, 'role': 'text', 'raw_text': raw,
+                              'spans': spans, 'normalized_text': normalized, 'normalization_map': mapping,
+                              'disposition': 'translate', 'unit_ids': []}
+                    self.regions.append(region)
+                    running_key = (page_no, tuple(round(v, 2) for v in bbox))
+                    if running_key in running_matter:
+                        region.update(role='running_matter', disposition='excluded',
+                                      evidence=running_matter[running_key])
+                        continue
+                    rect = pymupdf.Rect(bbox)
+                    containing_table = next((t for t in table_info if (rect & t[1]).get_area() >= .98 * max(rect.get_area(), 1)), None)
+                    if containing_table:
+                        owners = [c['id'] for c in containing_table[2] if (rect & pymupdf.Rect(c['spans'][0]['bbox'])).get_area() > 0]
+                        for cell in containing_table[2]:
+                            if cell['id'] in owners:
+                                cell['locators'][0]['block_id'] = min(block_id, cell['locators'][0].get('block_id', block_id))
+                        region.update(role='table_text', disposition='preserve', unit_ids=owners,
+                                      evidence={'reason': 'Represented by positioned table cells', 'table_id': containing_table[0]})
+                        continue
+                    if any((rect & table_rect).get_area() > .35 * max(rect.get_area(), 1) for _, table_rect, _ in table_info):
+                        self.warnings.append({'code': 'mixed_table_text_block', 'page': page_no, 'region_id': region_id,
+                                              'message': 'Text block partly intersects a table; manual structure review required'})
+                    max_font = max((s['size'] for s in spans), default=10)
+                    all_bold = bool(spans) and all('bold' in span['font'].casefold() for span in spans if span['text'].strip())
+                    heading = len(normalized) < 140 and ((SECTION_HEADING_REGEX.match(normalized) and max_font >= 11.5) or (all_bold and max_font >= 9 and not normalized.endswith('.')))
+                    base = {'section': section, 'page': page_no, 'spans': spans, 'locators': [locator],
+                            'parent_id': region_id, 'raw_source': raw, 'normalization_map': mapping, 'status': 'pending'}
+                    figure_match = FIGURE_CAPTION_REGEX.match(normalized)
+                    table_match = TABLE_CAPTION_REGEX.match(normalized)
+                    if page_no == 1 and max_font >= 15 and len(normalized) < 220 and not any(i['kind'] == 'title' for i in items):
+                        group = [{**base, 'id': 'document-title', 'kind': 'title', 'source': normalized}]
+                    elif heading:
+                        sec_idx += 1
+                        section = normalized
+                        group = [{**base, 'id': f'sec{sec_idx:02d}-head', 'kind': 'heading', 'section': section, 'source': normalized,
+                                  'heading_font_size': round(max_font, 2)}]
+                    elif figure_match:
+                        number = figure_match.group(1).rstrip('.:,;-')
+                        figure_counts[number] = figure_counts.get(number, 0) + 1
+                        fig_id = f'fig-{number}-cap' + (f'-p{page_no}-{figure_counts[number]}' if figure_counts[number] > 1 else '')
+                        candidates = [a for a in self.assets if str(a.get('figure_id')) == number and a.get('page') == page_no]
+                        candidates = [a for a in candidates if not a.get('caption_bbox') or (pymupdf.Rect(a['caption_bbox']) & rect).get_area() > 0]
+                        if len(candidates) > 1:
+                            raise ValueError(f'Ambiguous exact figure association: page {page_no} figure {number}')
+                        asset = candidates[0] if candidates else None
+                        item = {**base, 'id': fig_id, 'kind': 'figure', 'source': normalized, 'figure_no': number}
+                        if asset:
+                            item.update(asset_id=asset['asset_id'], image_path=asset['path'])
+                            asset.setdefault('owner_ids', []).append(fig_id)
+                        else:
+                            self.warnings.append({'code': 'missing_figure_asset', 'page': page_no, 'id': fig_id, 'figure_no': number})
+                        group = [item]
+                    elif table_match:
+                        number = table_match.group(1).rstrip('.:,;-')
+                        ordered = sorted(table_info, key=lambda t: min(abs(t[1].y0 - rect.y1), abs(rect.y0 - t[1].y1)))
+                        table_id = ordered[0][0] if ordered else f'p{page_no}-unparsed-table-{number}'
+                        group = [{**base, 'id': f'{table_id}-cap', 'kind': 'table', 'table_id': table_id, 'table_no': number, 'source': normalized}]
+                        if not ordered:
+                            self.warnings.append({'code': 'table_structure_unavailable', 'id': group[0]['id'], 'page': page_no})
+                    elif 'reference' in section.casefold() or 'bibliography' in section.casefold() or REFERENCE_LINE_REGEX.match(normalized):
+                        ref_idx += 1
+                        group = [{**base, 'id': f'ref-{ref_idx:03d}', 'kind': 'reference', 'source': normalized}]
+                    elif EQUATION_LINE_REGEX.search(normalized) and ('=' in normalized or '∑' in normalized) and len(normalized) < 300:
+                        equation_id = f'p{page_no}-b{block_id}-equation'
+                        item = {**base, 'id': equation_id, 'kind': 'equation', 'source': normalized, 'action': 'preserve', 'math_format': 'graphic'}
+                        if self.asset_dir:
+                            self.asset_dir.mkdir(parents=True, exist_ok=True)
+                            image_path = self.asset_dir / f'{equation_id}.png'
+                            page.get_pixmap(clip=rect + (-2, -2, 2, 2), dpi=300).save(image_path)
+                            asset_id = f'{doc_id[:16]}:{equation_id}'
+                            self.assets.append({'asset_id': asset_id, 'doc_id': doc_id, 'kind': 'equation', 'representation': 'raster',
+                                                'page': page_no, 'bbox': bbox, 'path': str(image_path), 'sha256': _sha(image_path),
+                                                'owner_ids': [equation_id], 'locators': [locator]})
+                            item.update(asset_id=asset_id, image_path=str(image_path))
+                        group = [item]
+                        region['disposition'] = 'preserve'
+                    else:
+                        containing_figures = [a for a in self.assets if a.get('page') == page_no and a.get('kind') == 'figure' and pymupdf.Rect(a['bbox']).contains(rect)]
+                        group = []
+                        bullet_starts = [m.start() for m in re.finditer(r'(?m)^[•●▪◦]\s+', raw)]
+                        ranges = []
+                        if bullet_starts:
+                            boundaries = sorted(set([0, *bullet_starts, len(raw)]))
+                            for first, last in zip(boundaries, boundaries[1:]):
+                                ranges.extend((sent, first + a, first + b, [[first + x, first + y] for x, y in mapping])
+                                              for sent, a, b, mapping in sentence_ranges(raw[first:last], split_en_sentences))
+                        else:
+                            ranges = sentence_ranges(raw, split_en_sentences)
+                        for sentence_index, (sentence, start, end, sentence_map) in enumerate(ranges):
+                            item_id = f'sec{sec_idx:02d}-p{page_no:03d}-b{block_index + 1:03d}-s{sentence_index + 1:03d}'
+                            item = {**base, 'id': item_id, 'kind': 'figure_label' if containing_figures else 'list_item' if bullet_starts else 'sentence',
+                                    'source': sentence, 'raw_source': raw[start:end], 'normalization_map': sentence_map,
+                                    'locators': [{**locator, 'start': start, 'end': end}]}
+                            if containing_figures:
+                                item['figure_asset_id'] = containing_figures[0]['asset_id']
+                            group.append(item)
+                    items.extend(group)
+                    region['unit_ids'] = [i['id'] for i in group]
+                if not any(r['locator'].get('page') == page_no and r.get('raw_text', '').strip() for r in self.regions):
+                    self.warnings.append({'code': 'page_has_no_native_text', 'page': page_no})
+                try:
+                    clusters = page.cluster_drawings()
+                except Exception as exc:
+                    clusters = []
+                    self.warnings.append({'code': 'drawing_detection_failed', 'page': page_no, 'message': str(exc)})
+                for drawing_index, graphic in enumerate(clusters):
+                    graphic = pymupdf.Rect(graphic)
+                    if graphic.width < 15 or graphic.height < 15:
+                        continue
+                    represented = any((graphic & rect).get_area() >= .95 * graphic.get_area() for _, rect, _ in table_info)
+                    represented = represented or any(a.get('page') == page_no and (graphic & pymupdf.Rect(a['bbox'])).get_area() >= .95 * graphic.get_area() for a in self.assets if a.get('bbox'))
+                    if not represented:
+                        region_id = f'p{page_no}:drawing{drawing_index}'
+                        self.regions.append({'region_id': region_id, 'locator': {**page_meta, 'region_id': region_id, 'bbox': list(graphic)},
+                                             'role': 'graphic', 'raw_text': '', 'disposition': 'needs_review', 'unit_ids': [],
+                                             'evidence': {'reason': 'Vector graphic has no confirmed figure/table association'}})
+                        self.warnings.append({'code': 'unbound_graphic', 'page': page_no, 'region_id': region_id})
+        heading_sizes = sorted({i['heading_font_size'] for i in items if i.get('kind') == 'heading'}, reverse=True)
         for item in items:
-            sections.add(item["section"])
-            kind = item["kind"]
-            if kind == "sentence":
-                sentence_count += 1
-            elif kind in ("figure", "figure_caption"):
-                figure_count += 1
-            elif kind in ("table", "table_caption", "table_cell"):
-                table_count += 1
-            elif kind == "reference":
-                reference_count += 1
-            elif kind == "equation":
-                equation_count += 1
+            if item.get('kind') == 'heading':
+                item['heading_level'] = min(6, heading_sizes.index(item['heading_font_size']) + 1)
+        return items
 
-        return {
-            "pages": total_pages,
-            "sections": len(sections),
-            "sentence_count": sentence_count,
-            "figure_count": figure_count,
-            "table_count": table_count,
-            "reference_count": reference_count,
-            "equation_count": equation_count,
-            "total_items": len(items)
-        }
+    def _compute_summary(self, items, total_pages):
+        kinds = [i['kind'] for i in items]
+        return {'pages': total_pages, 'sections': len({i.get('section', '') for i in items}),
+                'sentence_count': kinds.count('sentence'), 'figure_count': kinds.count('figure'),
+                'table_count': len({i.get('table_id', i['id']) for i in items if i['kind'] in ('table', 'table_cell')}),
+                'reference_count': kinds.count('reference'), 'equation_count': kinds.count('equation'), 'total_items': len(items)}
 
 
-def extract_document(input_path: str, output_jsonl: str = "source.jsonl",
-                     scope: str = "full", summary_path: str = None) -> dict:
-    """
-    Extracts structured document into a canonical source.jsonl file.
-    
-    Args:
-        input_path: Path to PDF, Markdown, or LaTeX document.
-        output_jsonl: Output path for canonical source.jsonl manifest.
-        scope: 'full' or 'body'.
-        summary_path: Optional path to save summary JSON statistics.
-        
-    Returns:
-        Summary statistics dict.
-    """
-    extractor = DocumentExtractor(scope=scope)
+def extract_document(input_path, output_jsonl='source.jsonl', scope='full', summary_path=None,
+                     job_dir=None, assets_manifest=None, backend='native', mineru_result=None, main_file=None, source_overlay=None):
+    extractor = DocumentExtractor(scope, assets_manifest=assets_manifest,
+                                  asset_dir=Path(job_dir) / 'extracted-assets' if job_dir else None,
+                                  backend='native' if backend == 'auto' else backend,
+                                  mineru_result=mineru_result, main_file=main_file, source_overlay=source_overlay)
     items, stats = extractor.extract(input_path)
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_jsonl)), exist_ok=True)
-    with open(output_jsonl, "w", encoding="utf-8") as f:
-        for item in items:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
+    if job_dir:
+        try:
+            from .document_ir import create_job
+        except ImportError:
+            from document_ir import create_job
+        create_job(input_path, job_dir, items, regions=extractor.regions, assets=extractor.assets,
+                   summary=stats, scope=scope, extra_document=extractor.extra_document)
+        stats['job_dir'] = str(Path(job_dir).resolve())
+    else:
+        Path(output_jsonl).resolve().parent.mkdir(parents=True, exist_ok=True)
+        with open(output_jsonl, 'w', encoding='utf-8') as stream:
+            for item in items:
+                stream.write(json.dumps(item, ensure_ascii=False) + '\n')
     if summary_path:
-        os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
-
+        Path(summary_path).resolve().parent.mkdir(parents=True, exist_ok=True)
+        Path(summary_path).write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding='utf-8')
     return stats
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Structured document extraction for academic papers")
-    parser.add_argument("input", help="Path to input document (PDF, Markdown, or LaTeX)")
-    parser.add_argument("--out", default="source.jsonl", help="Output path for canonical source.jsonl manifest")
-    parser.add_argument("--scope", default="full", choices=["full", "body"],
-                        help="Extraction scope ('full': all items; 'body': excludes references/footnotes)")
-    parser.add_argument("--summary", default=None, help="Optional output path for summary statistics JSON")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('input')
+    parser.add_argument('--out', default='source.jsonl')
+    parser.add_argument('--scope', choices=['full', 'body'], default='full')
+    parser.add_argument('--summary')
+    parser.add_argument('--job-dir')
+    parser.add_argument('--assets-manifest', help='Explicit document-bound figure/asset manifest; never discovered from cwd')
+    parser.add_argument('--backend', choices=['native', 'auto', 'mineru'], default='native')
+    parser.add_argument('--mineru-result', help='Complete, source-bound normalized MinerU result JSON')
+    parser.add_argument('--main-file', help='LaTeX main file relative to project directory')
+    parser.add_argument('--source-overlay', help='Source-hash-bound reviewed image text transcriptions; creates additional source IDs before freezing')
     args = parser.parse_args()
-
-    stats = extract_document(args.input, output_jsonl=args.out, scope=args.scope, summary_path=args.summary)
-    print("=" * 60)
-    print("Document Extraction Complete")
-    print("=" * 60)
-    print(f"  Scope:           {args.scope}")
-    print(f"  Pages:           {stats['pages']}")
-    print(f"  Sections:        {stats['sections']}")
-    print(f"  Sentences:       {stats['sentence_count']}")
-    print(f"  Figures:         {stats['figure_count']}")
-    print(f"  Tables:          {stats['table_count']}")
-    print(f"  References:      {stats['reference_count']}")
-    print(f"  Equations:       {stats['equation_count']}")
-    print(f"  Total Items:     {stats['total_items']}")
-    print(f"  Manifest Path:   {args.out}")
-    print("=" * 60)
+    try:
+        result = extract_document(args.input, args.out, args.scope, args.summary, args.job_dir,
+                                  args.assets_manifest, args.backend, args.mineru_result, args.main_file, args.source_overlay)
+    except (ValueError, OSError, ImportError) as exc:
+        print(f'Extraction failed: {exc}', file=sys.stderr)
+        return 4 if isinstance(exc, ImportError) else 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    raise SystemExit(main())

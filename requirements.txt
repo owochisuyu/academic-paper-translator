@@ -1,0 +1,11 @@
+# Core versions exercised by the implementation tests (Python 3.14.3 on Windows).
+# Use a project virtual environment. External OCR/translation/TeX engines are optional.
+# PyMuPDF 2.0 includes local layout/ONNX dependencies; find_tables defaults to
+# use_layout=True. Serial runs and OPENBLAS_NUM_THREADS=1 / OMP_NUM_THREADS=1 can
+# reduce resource contention. Do not switch to line-only detection on failure:
+# the reviewed EKF_CAL input loses all four tables with use_layout=False.
+# See references/backends.md for the observed failure, retry, and comparison.
+PyMuPDF==2.0
+typst==0.15.0
+Pillow==12.1.1
+markdown-it-py==4.2.0

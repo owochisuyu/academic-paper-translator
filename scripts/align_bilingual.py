@@ -35,7 +35,7 @@ def clean_text(text: str | None) -> str:
 
 # Common sentence starters following an abbreviation or sentence boundary
 _SENTENCE_STARTERS = (
-    r'(?:It|This|These|That|Those|There|Here|We|They|He|She|You|'
+    r'(?:The|A|An|Next|Both|Each|All|Only|It|This|These|That|Those|There|Here|We|They|He|She|You|'
     r'However|Therefore|Moreover|Furthermore|Additionally|In|On|At|For|'
     r'Since|As|Although|While|Thus|Hence|Consequently|Specifically|Finally|'
     r'Meanwhile|Nevertheless|Then|Now)'
@@ -103,7 +103,7 @@ def split_en_sentences(text: str) -> list[str]:
     """
     Split English text into sentences with comprehensive scientific protection.
 
-    Guarantees:
+    Boundary rules:
     - Protects titles (Dr., Prof., Mr., etc.)
     - Protects Latin / academic abbreviations (et al., i.e., e.g., cf., vs., etc.)
     - Protects paper elements (Fig., Table., Eq., Ref., Sec., pp., p. 12, etc.)
@@ -134,8 +134,17 @@ def split_en_sentences(text: str) -> list[str]:
         placeholders[ph] = match.group(0)
         return ph
 
-    # 1. Protect URLs and Emails
-    text = re.sub(r'https?://[^\s]+|www\.[^\s]+', replace_match, text)
+    def replace_url(match: re.Match) -> str:
+        nonlocal counter
+        raw = match.group(0)
+        url = raw.rstrip('.,;:!?')
+        ph = f"__PH_{counter}__"
+        counter += 1
+        placeholders[ph] = url
+        return ph + raw[len(url):]
+
+    # Sentence punctuation following a URL must remain a boundary candidate.
+    text = re.sub(r'https?://[^\s]+|www\.[^\s]+', replace_url, text)
     text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', replace_match, text)
 
     # 2. Protect ellipses: '...' or unicode '…'
@@ -146,7 +155,13 @@ def split_en_sentences(text: str) -> list[str]:
     text = re.sub(r'(?<=[\s\(\[])\.\d+\b|^(\.\d+\b)', replace_match, text)
 
     # 4. Protect abbreviations
-    text = _PREFIX_REGEX.sub(replace_match, text)
+    def replace_prefix(match: re.Match) -> str:
+        # Case-insensitive Ms. also matches the SI unit ms. after a quantity.
+        if match.group(0).casefold() == 'ms.' and re.search(r'(?:\d|__PH_\d+__)\s*$', text[:match.start()]):
+            return match.group(0)
+        return replace_match(match)
+
+    text = _PREFIX_REGEX.sub(replace_prefix, text)
     text = _CONTEXTUAL_REGEX.sub(replace_match, text)
 
     # 5. Split by sentence terminators

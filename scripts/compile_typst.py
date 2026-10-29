@@ -1,551 +1,614 @@
 # -*- coding: utf-8 -*-
-"""
-Post-acceptance Typst typesetting compiler for academic papers.
-Renders validated manifest items (with stable IDs) into publication-grade Typst source (.typ)
-and compiles them to high-resolution PDFs and page previews.
+"""Render canonical translation records. Low-level rendering is a draft preview API."""
+from __future__ import annotations
 
-Supports:
-- Mode A: Sentence-by-sentence bilingual interlinear (#bip)
-- Mode B: Full academic Chinese publication edition (#zhp)
-- Mode C: Paragraph-level bilingual edition
-- Mode D: Dual-column parallel layout
-"""
-
-import os
-import re
-import sys
-import json
 import argparse
-import subprocess
+import hashlib
+import json
+import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
 
 
-TYPST_HEADER_TEMPLATE = """#set page(
-  paper: "a4",
-  margin: (top: 2.2cm, bottom: 2.2cm, left: 2.0cm, right: 2.0cm),
-  header: context {
-    if counter(page).get().first() > 1 [
-      #text(size: 8pt, fill: luma(100))[
-        #grid(
-          columns: (1fr, 1fr),
-          align(left)[_%(journal)s_],
-          align(right)[%(running_title)s]
-        )
-        #v(-4pt)
-        #line(length: 100%, stroke: 0.5pt + luma(180))
-      ]
-    ]
-  },
-  footer: context [
-    #text(size: 8.5pt, fill: luma(120))[
-      #align(center)[- #counter(page).display() -]
-    ]
-  ]
-)
+class RenderError(ValueError):
+    pass
 
-#set text(font: ("Times New Roman", "Microsoft YaHei", "SimSun"), size: 9.5pt, lang: "zh")
-#set par(justify: true, leading: 0.78em)
-#set math.equation(numbering: "(1)")
 
-// Bilingual interlinear macro
-#let bip(en, zh) = [
-  #block(
-    width: 100%,
-    inset: (left: 0pt, right: 0pt, top: 1.5pt, bottom: 1.5pt),
-    [
-      #text(fill: luma(20), size: 9.5pt)[#en] \\
-      #v(1.5pt)
-      #text(fill: rgb("#1a4b77"), size: 9.2pt, font: ("Microsoft YaHei", "SimSun"))[#zh]
-    ]
-  )
-  #v(2.5pt)
-]
+def _ir():
+    try:
+        from . import document_ir
+    except ImportError:
+        import document_ir
+    return document_ir
 
-// Pure Chinese paragraph macro
-#let zhp(zh) = [
-  #block(
-    width: 100%,
-    inset: (left: 0pt, right: 0pt, top: 1.5pt, bottom: 1.5pt),
-    [
-      #text(fill: luma(15), size: 9.5pt, font: ("Microsoft YaHei", "SimSun"))[#zh]
-    ]
-  )
-  #v(2.5pt)
-]
 
-// Level 1 Section Heading
-#let h1(en, zh) = [
-  #v(16pt, weak: true)
-  #if en != "" [
-    #text(size: 13pt, weight: "bold")[#en] \\
-    #v(1.5pt)
-    #text(size: 11.5pt, weight: "bold", fill: rgb("#1a4b77"))[#zh]
-  ] else [
-    #text(size: 13pt, weight: "bold", fill: rgb("#1a4b77"))[#zh]
-  ]
-  #v(8pt, weak: true)
-]
-
-// Level 2 Section Heading
-#let h2(en, zh) = [
-  #v(12pt, weak: true)
-  #if en != "" [
-    #text(size: 11pt, weight: "bold")[#en] \\
-    #v(1.0pt)
-    #text(size: 10pt, weight: "bold", fill: rgb("#1a4b77"))[#zh]
-  ] else [
-    #text(size: 11pt, weight: "bold", fill: rgb("#1a4b77"))[#zh]
-  ]
-  #v(6pt, weak: true)
-]
-
-// Title and Metadata macro
-#let paper_title(en, zh, authors, affiliations) = [
-  #align(center)[
-    #if en != "" [
-      #text(size: 16pt, weight: "bold")[#en] \\
-      #v(3pt)
-      #text(size: 14pt, weight: "bold", fill: rgb("#1a4b77"))[#zh] \\
-    ] else [
-      #text(size: 16pt, weight: "bold", fill: rgb("#1a4b77"))[#zh] \\
-    ]
-    #if authors != "" [
-      #v(8pt)
-      #text(size: 10pt)[#authors] \\
-    ]
-    #if affiliations != "" [
-      #v(2pt)
-      #text(size: 8.5pt, fill: luma(80))[#emph(affiliations)]
-    ]
-    #v(14pt)
-  ]
-]
-"""
+def _literal(value):
+    return json.dumps(str(value), ensure_ascii=False)
 
 
 def escape_typst_content(text: str) -> str:
-    """
-    Escapes special characters in text when embedded inside Typst content blocks [ ... ].
-    Inside content blocks:
-    - '#' triggers code execution -> escape to '\\#'
-    - '@' triggers reference/label -> escape to '\\@'
-    - '$' starts math mode -> escape to '\\$' if literal (preserve if intended)
-    - Unpaired brackets '[' or ']' are escaped to prevent delimiter mismatch
-    - Double quotes '"' and citation references like '[1]' are safe in content blocks
-    """
-    if not text:
-        return ""
-    res = str(text)
-    # Escape code and label triggers
-    res = res.replace("#", "\\#")
-    res = res.replace("@", "\\@")
-    # Balance brackets: if brackets are unbalanced, escape them
-    open_b = res.count("[")
-    close_b = res.count("]")
-    if open_b != close_b:
-        res = res.replace("[", "\\[").replace("]", "\\]")
-    return res
+    """Compatibility helper; literal text is emitted as a Typst string, never code."""
+    return '#text(' + _literal(text or '') + ')'
 
 
-def render_typst_document(manifest_items: list[dict], mode: str = "A", metadata: dict = None, typ_dir: str = ".") -> str:
-    """
-    Renders manifest items into Typst source code.
-    mode:
-      - 'A': Bilingual interlinear (#bip)
-      - 'B': Full Chinese publication (#zhp)
-      - 'C': Paragraph-level bilingual
-      - 'D': Dual-column bilingual layout
-    """
-    meta = metadata or {}
-    journal = meta.get("journal", "Academic Translation")
-    running_title = meta.get("running_title", "Academic Paper Translator")
+TYPST_HEADER_TEMPLATE = r'''#set page(paper: "a4", margin: (x: 20mm, y: 20mm),
+  footer: context align(center, text(size: 8pt, counter(page).display())))
+#set text(font: ("Times New Roman", "Microsoft YaHei", "SimSun", "Noto Serif CJK SC"), size: 10pt, lang: "zh")
+#set par(justify: false, leading: 0.75em)
+#let en(t) = t
+#let zh(t) = text(fill: rgb("1a4b77"))[#t]
+#let bip(a, b) = context layout(size => {
+  let pair = [#en(a) #if b != a [#parbreak()#zh(b)]]
+  let short = measure(pair, width: size.width).height <= 45mm
+  block(breakable: not short, width: 100%, inset: (y: 2pt), pair)
+})
+#let zhp(t) = block(breakable: true, width: 100%, inset: (y: 2pt))[#zh(t)]
+#let parallel(a, b) = table(columns: (1fr, 1fr), stroke: none, inset: 5pt,
+  table.cell(breakable: true)[#en(a)], table.cell(breakable: true)[#zh(b)])
+'''
 
-    # Safe template substitution without format string collision
-    header = TYPST_HEADER_TEMPLATE.replace("%(journal)s", journal).replace("%(running_title)s", running_title)
-    # Ensure any double %% from format strings or external patches is sanitized back to valid Typst syntax (100%)
-    header = re.sub(r'100%+', '100%', header)
 
-    body_lines = [header]
+def _texts(item, draft):
+    source = item.get('source', '')
+    if not isinstance(source, str):
+        raise RenderError(f"Non-string source: {item.get('id')}")
+    if item.get('action') == 'preserve':
+        return source, source
+    target = item.get('translation')
+    if not isinstance(target, str) or (source.strip() and not target.strip()):
+        if draft:
+            return source, '[UNTRANSLATED] ' + source
+        raise RenderError(f"Missing translation: {item.get('id')}")
+    return source, target
 
-    if mode == "D":
-        body_lines.append("#set page(columns: 2)\n")
 
-    title_en = meta.get("title_en", "")
-    title_zh = meta.get("title_zh", "")
-    authors = meta.get("authors", "")
-    affiliations = meta.get("affiliations", "")
+def _heading_level(item):
+    return max(1, min(6, int(item.get('heading_level', item.get('level', 1)))))
 
-    if title_en or title_zh:
-        body_lines.append(
-            f'#paper_title([{escape_typst_content(title_en)}], [{escape_typst_content(title_zh)}], [{escape_typst_content(authors)}], [{escape_typst_content(affiliations)}])\n'
-        )
 
-    current_section = None
+def _markdown_parts(text, item):
+    """Parse delimited inline math only for Markdown provenance, outside code spans."""
+    markdown = item.get('source_format') in ('markdown', 'md') or any(
+        Path(locator.get('file', '')).suffix.lower() in ('.md', '.markdown', '.mdown')
+        for locator in item.get('locators', []))
+    if not markdown or item.get('kind') == 'code':
+        return [('text', text)]
+    parts, position, plain_start = [], 0, 0
+    while position < len(text):
+        if text[position] == '`':
+            fence = re.match(r'`+', text[position:]).group()
+            end = text.find(fence, position + len(fence))
+            position = end + len(fence) if end >= 0 else len(text)
+            continue
+        if text.startswith(r'\(', position):
+            end = text.find(r'\)', position + 2)
+            if end < 0:
+                raise RenderError('Unclosed Markdown inline math delimiter')
+            closing = end + 2
+        elif text[position] == '$' and (position == 0 or text[position - 1] != '\\'):
+            # Double dollars belong to display-math units. A closing dollar followed
+            # by a digit is currency, e.g. "$5 to $10", not an inline formula.
+            if text.startswith('$$', position):
+                raise RenderError('Display Markdown math must be a separate equation unit')
+            match = re.match(r'\$(?=\S)([^\n$]*?\S)(?<!\\)\$(?![\d$])', text[position:])
+            if not match:
+                if position + 1 < len(text) and (text[position + 1].isalpha() or text[position + 1] in '\\_{'):
+                    raise RenderError('Unclosed or ambiguous Markdown inline math delimiter')
+                position += 1
+                continue
+            closing = position + match.end()
+        else:
+            position += 1
+            continue
+        if position > plain_start:
+            parts.append(('text', text[plain_start:position]))
+        parts.append(('math', latex_to_typst(text[position:closing])))
+        plain_start = position = closing
+    if plain_start < len(text):
+        parts.append(('text', text[plain_start:]))
+    return parts
 
-    # Group items to handle tables and table cells together
-    i = 0
-    n = len(manifest_items)
-    while i < n:
-        item = manifest_items[i]
-        kind = item.get("kind", "sentence")
-        en = (item.get("source") or "").strip()
-        zh = (item.get("translation") or "").strip() or en
 
-        # Section header check
-        sec = item.get("section")
-        if sec and sec != current_section:
-            current_section = sec
-            if kind != "heading":
-                sec_zh = item.get("section_zh", sec)
-                body_lines.append(f'\n#h1([{escape_typst_content(sec)}], [{escape_typst_content(sec_zh)}])\n')
+def _display_parts(text, item=None):
+    """Restore registered TeX tokens and bounded Markdown math without executing source."""
+    item = item or {}
+    tokens = item.get('protected_tokens', {})
+    if not tokens:
+        return _markdown_parts(text, item)
+    parts = []
+    for piece in re.split(r'(⟦TEX[0-9]+⟧)', text):
+        if not piece:
+            continue
+        if piece not in tokens:
+            if piece.startswith('⟦TEX'):
+                raise RenderError('Unregistered protected token')
+            parts.extend(_markdown_parts(piece, item))
+            continue
+        raw = tokens[piece]
+        if raw.startswith('$') or raw.startswith(r'\(') or raw.startswith(r'\['):
+            parts.append(('math', latex_to_typst(raw)))
+        elif re.fullmatch(r'\\(?:textbf|textit|emph|textrm|texttt|textsf|underline)\{', raw) or raw == '}':
+            continue
+        elif re.fullmatch(r'\\cite[a-zA-Z]*\{[^{}]+\}', raw):
+            parts.append(('text', '[' + raw[raw.index('{')+1:-1] + ']'))
+        elif re.fullmatch(r'\\(?:eqref|ref|autoref)\{[^{}]+\}', raw):
+            parts.append(('text', '[ref:' + raw[raw.index('{')+1:-1] + ']'))
+        elif re.fullmatch(r'\\url\{[^{}]+\}', raw):
+            parts.append(('text', raw[5:-1]))
+        elif raw in (r'\%', r'\_', r'\&', r'\#', r'\$', r'\{', r'\}'):
+            parts.append(('text', raw[1:]))
+        else:
+            raise RenderError(f'Unsupported protected TeX token: {raw}')
+    return parts
 
-        if kind == "heading":
-            level = item.get("level", 1)
-            macro = "h1" if level == 1 else "h2"
-            if mode == "B":
-                body_lines.append(f'\n#{macro}([], [{escape_typst_content(zh)}])\n')
-            else:
-                body_lines.append(f'\n#{macro}([{escape_typst_content(en)}], [{escape_typst_content(zh)}])\n')
-            i += 1
 
-        elif kind == "sentence":
-            if mode == "A":
-                body_lines.append(f'#bip([{escape_typst_content(en)}], [{escape_typst_content(zh)}])')
-            elif mode == "B":
-                body_lines.append(f'#zhp([{escape_typst_content(zh)}])')
-            elif mode == "C":
-                body_lines.append(f'[{escape_typst_content(en)}]\n\n#text(fill: rgb("#1a4b77"))[{escape_typst_content(zh)}]\n')
-            elif mode == "D":
-                body_lines.append(f'#bip([{escape_typst_content(en)}], [{escape_typst_content(zh)}])')
-            i += 1
+def _content(text, item=None):
+    # Whitespace immediately inside BOTH dollar delimiters makes Typst display math.
+    # These parts belong inside prose; standalone equation units use display markup.
+    return '[' + ''.join(escape_typst_content(value) if kind == 'text' else '$' + value.strip() + '$' for kind, value in _display_parts(text, item)) + ']'
 
-        elif kind == "equation":
-            eq_typ = item.get("typst_math") or item.get("latex") or en
-            # Strip outer $ if present
-            eq_typ = eq_typ.strip()
-            if eq_typ.startswith("$") and eq_typ.endswith("$"):
-                eq_typ = eq_typ[1:-1].strip()
-            body_lines.append(f'\n$ {eq_typ} $\n')
-            i += 1
 
-        elif kind == "figure":
-            fig_path = item.get("image_path", "")
-            fig_no = item.get("figure_no") or item.get("id", "").replace("fig-", "").replace("-cap", "")
-            cap_en = en
-            cap_zh = zh
+def _pair(source, target, mode, preserve=False, item=None):
+    if preserve:
+        return '#block(breakable: true)' + _content(source, item)
+    if mode == 'B':
+        return f'#zhp({_content(target, item)})'
+    if mode == 'D':
+        return f'#parallel({_content(source, item)}, {_content(target, item)})'
+    return f'#bip({_content(source, item)}, {_content(target, item)})'
 
-            clean_no = re.sub(r'[^A-Za-z0-9_.-]', '_', str(fig_no))
 
-            # Helper to check if a file path is valid
-            def resolve_img_file(path_cand):
-                if not path_cand:
-                    return None
-                # Check directly
-                if os.path.isfile(path_cand):
-                    return os.path.abspath(path_cand)
-                # Check relative to typ_dir
-                cand_typ = os.path.join(typ_dir, path_cand)
-                if os.path.isfile(cand_typ):
-                    return os.path.abspath(cand_typ)
-                # Check relative to cwd
-                cand_cwd = os.path.abspath(path_cand)
-                if os.path.isfile(cand_cwd):
-                    return cand_cwd
-                return None
+def latex_to_typst(value: str) -> str:
+    """A deliberately small converter. Unsupported syntax is an explicit error."""
+    value = value.strip()
+    value = re.sub(r'^\\begin\{equation\*?\}|\\end\{equation\*?\}$', '', value).strip()
+    for left, right in [('$$', '$$'), ('\\[', '\\]'), ('\\(', '\\)'), ('$', '$')]:
+        if value.startswith(left) and value.endswith(right):
+            value = value[len(left):-len(right)].strip()
+            break
+    aliases = {'times': 'times', 'cdot': 'dot', 'pm': 'plus.minus', 'le': '<=', 'leq': '<=',
+               'ge': '>=', 'geq': '>=', 'neq': '!=', 'approx': 'approx', 'infty': 'infinity'}
+    names = set('alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma tau phi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Phi Psi Omega sin cos tan log ln exp'.split())
+    pos = 0
 
-            resolved_path = resolve_img_file(fig_path)
+    def group():
+        nonlocal pos
+        while pos < len(value) and value[pos].isspace():
+            pos += 1
+        if pos >= len(value) or value[pos] != '{':
+            raise RenderError('LaTeX command requires a braced argument')
+        pos += 1
+        return parse('}')
 
-            # If not found directly, discover from figures_manifest.json or common paths
-            if not resolved_path:
-                manifest_search_roots = [typ_dir, "."]
-                if "manifest_path" in meta:
-                    manifest_search_roots.append(os.path.dirname(os.path.abspath(meta["manifest_path"])))
-
-                # Collect all figures_manifest.json files
-                found_manifests = []
-                for s_root in manifest_search_roots:
-                    if not os.path.isdir(s_root):
+    def parse(end=None):
+        nonlocal pos
+        out = []
+        while pos < len(value):
+            char = value[pos]
+            if end and char == end:
+                pos += 1
+                return ''.join(out)
+            if char == '\\':
+                pos += 1
+                match = re.match(r'[A-Za-z]+', value[pos:])
+                if not match:
+                    if pos < len(value) and value[pos] in ',;! ':
+                        pos += 1
+                        out.append(' ')
                         continue
-                    for root, dirs, files in os.walk(s_root):
-                        rel_parts = os.path.relpath(root, s_root).split(os.sep)
-                        if len(rel_parts) > 3:
-                            dirs.clear()
-                            continue
-                        if "figures_manifest.json" in files:
-                            found_manifests.append(os.path.join(root, "figures_manifest.json"))
-
-                for mf_path in found_manifests:
-                    mf_dir = os.path.dirname(os.path.abspath(mf_path))
-                    try:
-                        with open(mf_path, "r", encoding="utf-8") as mf:
-                            fig_list = json.load(mf)
-                            for f_entry in fig_list:
-                                e_id = str(f_entry.get("figure_id", ""))
-                                e_path = f_entry.get("image_path", "")
-                                if e_id == str(fig_no) or clean_no in e_path:
-                                    # Candidate locations for this image
-                                    cands = [
-                                        e_path,
-                                        os.path.join(mf_dir, os.path.basename(e_path)),
-                                        os.path.join(mf_dir, f"fig_{clean_no}.png"),
-                                        os.path.join(mf_dir, f"fig_{e_id}.png")
-                                    ]
-                                    for c in cands:
-                                        res = resolve_img_file(c)
-                                        if res:
-                                            resolved_path = res
-                                            break
-                                if resolved_path:
-                                    break
-                    except Exception:
-                        pass
-                    if resolved_path:
-                        break
-
-            # Fallback check common naming conventions
-            if not resolved_path:
-                common_cands = [
-                    f"paper_figures/fig_{clean_no}.png",
-                    f"figures/fig_{clean_no}.png",
-                    f"column-figures/fig_{clean_no}.png",
-                    f"fig_{clean_no}.png"
-                ]
-                for c in common_cands:
-                    res = resolve_img_file(c)
-                    if res:
-                        resolved_path = res
-                        break
-
-            # Strip redundant 'Fig. X' prefix from caption text if already in fig_no
-            clean_cap_en = re.sub(r'^(?:Fig\.|Figure|Supplementary\s+Figure)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', cap_en, flags=re.I).strip()
-            clean_cap_zh = re.sub(r'^(?:图|附图)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', cap_zh).strip()
-            if not clean_cap_en:
-                clean_cap_en = cap_en
-            if not clean_cap_zh:
-                clean_cap_zh = cap_zh
-
-            # Typst requires relative paths to the .typ file directory
-            if resolved_path and os.path.isfile(resolved_path):
-                rel_fig_path = os.path.relpath(resolved_path, typ_dir).replace('\\', '/')
-                img_block = f'image("{rel_fig_path}", width: 85%)'
+                    raise RenderError('Unsupported LaTeX escape')
+                command = match.group()
+                pos += len(command)
+                if command == 'frac':
+                    numerator, denominator = group(), group()
+                    out.append(f'frac({numerator}, {denominator})')
+                elif command == 'sqrt':
+                    out.append(f'sqrt({group()})')
+                elif command in ('left', 'right'):
+                    continue
+                elif command in aliases:
+                    out.append(' ' + aliases[command] + ' ')
+                elif command in names:
+                    out.append(' ' + command + ' ')
+                else:
+                    raise RenderError(f'Unsupported LaTeX command: \\{command}')
+            elif char == '{':
+                pos += 1
+                out.append('(' + parse('}') + ')')
+            elif char in '#@$&"' or char == '}':
+                raise RenderError(f'Unsupported math character: {char}')
             else:
-                img_block = (
-                    f'rect(width: 85%, height: 60pt, stroke: 0.5pt + luma(180), fill: luma(250))[\n'
-                    f'  #align(center + horizon)[#text(fill: luma(120), size: 8.5pt)[Figure {fig_no}]]\n'
-                    f']'
-                )
+                pos += 1
+                out.append(char)
+        if end:
+            raise RenderError('Unclosed LaTeX group')
+        return ''.join(out)
 
-            cap_header_en = f'#text(weight: "bold")[Fig. {fig_no}] ' if fig_no else ""
-            cap_header_zh = f'#text(weight: "bold", fill: rgb("#1a4b77"))[图 {fig_no}] ' if fig_no else ""
+    result = parse().strip()
+    if not result:
+        raise RenderError('Empty formula')
+    return result
 
-            body_lines.append(f"""
-#figure(
-  {img_block},
-  caption: [
-    {cap_header_en}{escape_typst_content(clean_cap_en)} \\
-    {cap_header_zh}{escape_typst_content(clean_cap_zh)}
-  ]
-)
-""")
-            i += 1
 
-        elif kind in ("table", "table_cell"):
-            # Render a single table grouped strictly by table_id
-            tbl_caption_en = ""
-            tbl_caption_zh = ""
-            tbl_code = None
-            tbl_cells = []
+def _math(item):
+    value = item.get('typst_math') or item.get('latex') or item.get('source', '')
+    fmt = item.get('math_format') or item.get('format')
+    if fmt is None:
+        fmt = 'latex' if '\\' in value else 'typst_math'
+    if fmt == 'latex':
+        return latex_to_typst(value)
+    if fmt != 'typst_math':
+        raise RenderError(f'Unsupported mathematical representation: {fmt}')
+    value = value.strip().strip('$').strip()
+    if not value or any(char in value for char in '#[]{};"\\'):
+        raise RenderError('Unsupported or unsafe Typst math expression')
+    return value
 
-            if kind == "table":
-                tbl_caption_en = en
-                tbl_caption_zh = zh
-                tbl_code = item.get("typst_code")
-                active_tbl_id = item.get("table_id") or item.get("id", "").replace("-cap", "")
-                i += 1
-                # Collect following table_cells belonging strictly to THIS table
-                while i < n and manifest_items[i].get("kind") == "table_cell":
-                    cell_tbl_id = manifest_items[i].get("table_id")
-                    if active_tbl_id and cell_tbl_id and cell_tbl_id != active_tbl_id:
-                        break
-                    tbl_cells.append(manifest_items[i])
-                    i += 1
+
+def _asset_path(item, meta, typ_dir, draft):
+    assets = meta.get('assets', [])
+    if isinstance(assets, dict):
+        assets = assets.get('assets', list(assets.values()))
+    matches = [a for a in assets if a.get('asset_id') == item.get('asset_id')] if item.get('asset_id') else []
+    if len(matches) > 1:
+        raise RenderError(f"Duplicate asset ID: {item.get('asset_id')}")
+    if matches:
+        asset = matches[0]
+        path = Path(meta.get('asset_root', typ_dir)) / asset['path']
+        if not path.is_file():
+            raise RenderError(f"Missing asset: {asset['asset_id']}")
+        if asset.get('sha256') and hashlib.sha256(path.read_bytes()).hexdigest() != asset['sha256']:
+            raise RenderError(f"Asset hash changed: {asset['asset_id']}")
+        if item.get('doc_id') and asset.get('doc_id') != item['doc_id']:
+            raise RenderError('Cross-document asset binding')
+        return path.resolve()
+    # Legacy preview accepts an explicit path, never directory/name discovery.
+    if draft and item.get('image_path'):
+        path = Path(item['image_path'])
+        if not path.is_absolute():
+            path = Path(meta.get('asset_root', typ_dir)) / path
+        if path.is_file():
+            return path.resolve()
+    if draft:
+        return None
+    raise RenderError(f"Missing explicit asset binding for {item.get('id')}")
+
+
+def _table_key(item):
+    return item.get('table_id') or '__legacy_table__'
+
+
+def _render_table(cells, captions, mode, draft):
+    rows, cols, occupied = 0, 0, set()
+    lines = []
+    for cell in sorted(cells, key=lambda c: (c.get('row', 0), c.get('col', 0))):
+        r, c = cell.get('row', 0), cell.get('col', 0)
+        rs, cs = cell.get('rowspan', 1), cell.get('colspan', 1)
+        if not all(isinstance(n, int) for n in (r, c, rs, cs)) or min(r, c) < 0 or min(rs, cs) < 1:
+            raise RenderError('Invalid table cell coordinates')
+        area = {(rr, cc) for rr in range(r, r + rs) for cc in range(c, c + cs)}
+        if occupied & area:
+            raise RenderError('Overlapping or duplicate table cells')
+        occupied |= area
+        rows, cols = max(rows, r + rs), max(cols, c + cs)
+        en, zh = _texts(cell, draft)
+        content = _pair(en, zh, 'B' if mode == 'B' else 'A', cell.get('action') == 'preserve', cell)
+        lines.append(f' table.cell(x: {c}, y: {r}, rowspan: {rs}, colspan: {cs})[{content}],')
+    if cells:
+        # Missing cells cannot be silently invented in a canonical table.
+        if not draft and occupied != {(r, c) for r in range(rows) for c in range(cols)}:
+            raise RenderError('Incomplete table grid; register empty cells explicitly')
+        result = [f'#table(columns: {cols}, stroke: none, inset: 5pt,',
+                  ' table.hline(y: 0, stroke: 1pt),', *lines,
+                  f' table.hline(y: {rows}, stroke: 1pt),', ')']
+    elif draft:
+        result = ['#text(fill: red)[DRAFT: table cells unavailable]']
+    else:
+        raise RenderError('Table has a caption but no cells')
+    for caption in captions:
+        result.append(_pair(*_texts(caption, draft), mode, caption.get('action') == 'preserve', caption))
+    return '\n'.join(result)
+
+
+def render_typst_document(manifest_items: list[dict], mode='A', metadata=None, typ_dir='.') -> str:
+    """Render a preview by default. Production callers must use compile_job()."""
+    if mode not in 'ABCD' or len(mode) != 1:
+        raise RenderError(f'Unknown mode: {mode}')
+    meta = metadata or {}
+    draft = meta.get('output_stage', 'draft') == 'draft'
+    body = [TYPST_HEADER_TEMPLATE]
+    if draft:
+        body.append('#text(fill: red, weight: "bold")[DRAFT — not accepted]')
+    tables = {}
+    for item in manifest_items:
+        if item.get('kind') in ('table', 'table_cell', 'table_caption'):
+            bucket = tables.setdefault(_table_key(item), {'cells': [], 'captions': []})
+            bucket['cells' if item['kind'] == 'table_cell' else 'captions'].append(item)
+    rendered_tables = set()
+    index = 0
+    text_kinds = {'sentence', 'paragraph', 'text', 'heading', 'title', 'abstract', 'keyword',
+                  'keywords', 'footnote', 'reference', 'list_item', 'figure_label', 'caption', 'figure_caption', 'code', 'preserved'}
+    while index < len(manifest_items):
+        item = manifest_items[index]
+        kind = item.get('kind', 'sentence')
+        index += 1
+        if kind in ('table', 'table_cell', 'table_caption'):
+            key = _table_key(item)
+            if key not in rendered_tables:
+                table = tables[key]
+                body.append(_render_table(table['cells'], table['captions'], mode, draft))
+                rendered_tables.add(key)
+            continue
+        if kind in ('figure', 'equation', 'math') and (kind == 'figure' or item.get('asset_id') or item.get('math_format') == 'graphic'):
+            path = _asset_path(item, meta, typ_dir, draft)
+            if path:
+                relative = os.path.relpath(path, typ_dir).replace('\\', '/')
+                body.append(f'#align(center)[#image({_literal(relative)}, width: 85%)]')
             else:
-                # Starting with table_cell, collect cells with the SAME table_id
-                active_tbl_id = item.get("table_id")
-                while i < n and manifest_items[i].get("kind") == "table_cell":
-                    cell_tbl_id = manifest_items[i].get("table_id")
-                    if active_tbl_id and cell_tbl_id and cell_tbl_id != active_tbl_id:
-                        break
-                    tbl_cells.append(manifest_items[i])
-                    i += 1
-                # Check if immediately followed by matching table caption
-                if i < n and manifest_items[i].get("kind") == "table":
-                    cell_tbl_id = manifest_items[i].get("table_id")
-                    if not active_tbl_id or not cell_tbl_id or cell_tbl_id == active_tbl_id:
-                        tbl_caption_en = manifest_items[i].get("source", "").strip()
-                        tbl_caption_zh = manifest_items[i].get("translation", "").strip() or tbl_caption_en
-                        tbl_code = manifest_items[i].get("typst_code")
-                        i += 1
-
-            if tbl_code:
-                body_lines.append(f"\n{tbl_code}\n")
-            elif tbl_cells:
-                # Compute table dimensions
-                max_row = max((c.get("row", 0) for c in tbl_cells), default=0)
-                max_col = max((c.get("col", 0) for c in tbl_cells), default=0)
-                num_cols = max(max_col + 1, 1)
-
-                # Organize into grid
-                grid_cells = {}
-                for cell in tbl_cells:
-                    r = cell.get("row", 0)
-                    c = cell.get("col", 0)
-                    grid_cells[(r, c)] = cell
-
-                # Generate Typst table
-                cell_renders = []
-                for r in range(max_row + 1):
-                    for c in range(num_cols):
-                        c_item = grid_cells.get((r, c))
-                        if c_item:
-                            c_src = escape_typst_content(c_item.get("source", "").strip())
-                            c_tgt = escape_typst_content(c_item.get("translation", "").strip() or c_src)
-                            if mode == "A" and c_tgt and c_tgt != c_src:
-                                cell_renders.append(f'  [{c_src} \\ #text(fill: rgb("#1a4b77"), size: 8pt)[{c_tgt}]],')
-                            elif mode == "B" and c_tgt:
-                                cell_renders.append(f'  [{c_tgt}],')
-                            else:
-                                cell_renders.append(f'  [{c_tgt or c_src}],')
-                        else:
-                            cell_renders.append('  [],')
-
-                clean_tbl_en = re.sub(r'^(?:Table|Tab\.)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', tbl_caption_en, flags=re.I).strip()
-                clean_tbl_zh = re.sub(r'^(?:表|附表)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', tbl_caption_zh).strip()
-                if not clean_tbl_en:
-                    clean_tbl_en = tbl_caption_en
-                if not clean_tbl_zh:
-                    clean_tbl_zh = tbl_caption_zh
-
-                cap_str = ""
-                if clean_tbl_en or clean_tbl_zh:
-                    cap_str = (
-                        f'  caption: [\n'
-                        f'    #text(weight: "bold")[{escape_typst_content(clean_tbl_en)}] \\\n'
-                        f'    #text(weight: "bold", fill: rgb("#1a4b77"))[{escape_typst_content(clean_tbl_zh)}]\n'
-                        f'  ],\n'
-                    )
-
-                body_lines.append(f"""
-#figure(
-{cap_str}  table(
-    columns: {num_cols},
-    stroke: none,
-    table.hline(stroke: 1.2pt),
-{chr(10).join(cell_renders)}
-    table.hline(stroke: 1.2pt),
-  )
-)
-""")
-            else:
-                # Table caption only, render figure box so caption is preserved
-                clean_tbl_en = re.sub(r'^(?:Table|Tab\.)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', tbl_caption_en, flags=re.I).strip()
-                clean_tbl_zh = re.sub(r'^(?:表|附表)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', tbl_caption_zh).strip()
-                if not clean_tbl_en:
-                    clean_tbl_en = tbl_caption_en
-                if not clean_tbl_zh:
-                    clean_tbl_zh = tbl_caption_zh
-
-                body_lines.append(f"""
-#figure(
-  caption: [
-    #text(weight: "bold")[{escape_typst_content(clean_tbl_en)}] \\
-    #text(weight: "bold", fill: rgb("#1a4b77"))[{escape_typst_content(clean_tbl_zh)}]
-  ],
-  table(
-    columns: 1,
-    stroke: none,
-    table.hline(stroke: 1.2pt),
-    [#text(fill: luma(100), size: 8.5pt)[Table content preserved in source]],
-    table.hline(stroke: 1.2pt),
-  )
-)
-""")
-
-        elif kind == "reference":
-            body_lines.append(f'+ [{escape_typst_content(en)}] \n  #text(fill: rgb("#1a4b77"), size: 8.5pt)[{escape_typst_content(zh)}]\n')
-            i += 1
-
+                body.append('#text(fill: red)[DRAFT: missing graphic]')
+            if kind == 'figure' and item.get('source', '').strip():
+                body.append(_pair(*_texts(item, draft), mode, item.get('action') == 'preserve', item))
+            continue
+        if kind in ('equation', 'math'):
+            body.append('$ ' + _math(item) + ' $')
+            if item.get('label'):
+                body.append('#align(right)[' + escape_typst_content(item['label']) + ']')
+            continue
+        if kind not in text_kinds:
+            raise RenderError(f'No renderer for kind {kind!r}: {item.get("id")}')
+        en, zh = _texts(item, draft)
+        preserve = item.get('action') == 'preserve'
+        # C groups adjacent units by actual paragraph identity. D aligns each paragraph row.
+        if mode in ('C', 'D') and kind in ('sentence', 'paragraph', 'text') and item.get('parent_id') and not item.get('protected_tokens'):
+            while index < len(manifest_items):
+                following = manifest_items[index]
+                if following.get('kind') not in ('sentence', 'paragraph', 'text') or following.get('parent_id') != item['parent_id'] or following.get('protected_tokens') or (following.get('action') == 'preserve') != preserve:
+                    break
+                e2, z2 = _texts(following, draft)
+                en, zh = en + ' ' + e2, zh + ' ' + z2
+                index += 1
+        pair = _pair(en, zh, mode, preserve, item)
+        if kind in ('heading', 'title'):
+            body.append('#heading(level: ' + str(_heading_level(item)) + ', outlined: false)[' + pair + ']')
         else:
-            # Fallback for generic text
-            body_lines.append(f'#bip([{escape_typst_content(en)}], [{escape_typst_content(zh)}])')
-            i += 1
-
-    return "\n".join(body_lines)
+            body.append(pair)
+    return '\n\n'.join(body) + '\n'
 
 
-def compile_typst(typst_file: str, output_pdf: str = None, generate_previews: bool = False, ppi: int = 150) -> bool:
+def _math_glyph_text(value):
+    """Linear glyph evidence for simple arithmetic; layout still needs visual review.
+
+    Fractions, roots, named functions/symbols and complex attachment groups have no
+    universal PDF extraction order, so those remain explicit visual-math checks.
     """
-    Compiles a .typ file to PDF and optional PNG previews using Python typst package or typst CLI.
-    """
-    pdf_out = output_pdf or (os.path.splitext(typst_file)[0] + ".pdf")
+    if re.search(r'[A-Za-z]{2,}', value) or not re.fullmatch(r'[A-Za-z0-9\s_\^()+\-=<>.,]+', value):
+        return None
+    value = re.sub(r'[_^]\(([^()]*)\)', r'\1', value)
+    if re.search(r'[_^]\(', value):
+        return None
+    value = value.replace('_', '').replace('^', '')
+    return value.replace('<=', '≤').replace('>=', '≥').replace('-', '−')
 
+
+def expected_content(items, mode):
+    segments, graphics, math_ids = [], [], []
+    for item in items:
+        kind = item.get('kind', 'sentence')
+        if item.get('asset_id'):
+            graphics.append({'id': item['id'], 'asset_id': item['asset_id']})
+        if kind in ('equation', 'math'):
+            math_ids.append(item.get('id'))
+            if not item.get('asset_id') and item.get('math_format') != 'graphic':
+                glyphs = _math_glyph_text(_math(item))
+                if glyphs:
+                    segments.append({'id': item.get('id'), 'language': 'source', 'text': glyphs,
+                                     'verification': 'math_glyphs'})
+            continue
+        en, zh = _texts(item, False)
+        texts = [('source', en)] if item.get('action') == 'preserve' else ([('translation', zh)] if mode == 'B' else [('source', en)] + ([] if zh == en else [('translation', zh)]))
+        for language, text in texts:
+            if text.strip():
+                for part_kind, part in _display_parts(text, item):
+                    if part_kind == 'text' and part.strip():
+                        segments.append({'id': item.get('id'), 'language': language, 'text': part})
+                    elif part_kind == 'math':
+                        if item.get('id') not in math_ids:
+                            math_ids.append(item.get('id'))
+                        glyphs = _math_glyph_text(part)
+                        if glyphs:
+                            segments.append({'id': item.get('id'), 'language': language, 'text': glyphs,
+                                             'verification': 'math_glyphs'})
+    return segments, graphics, math_ids
+
+
+def export_markdown(items, mode='A', asset_paths=None):
+    """Export the same records, including structured tables and portable asset links."""
+    import html
+    asset_paths = asset_paths or {}
+    out, tables, rendered = [], {}, set()
+
+    def values(item):
+        en, zh = _texts(item, False)
+        for token, raw in item.get('protected_tokens', {}).items():
+            en, zh = en.replace(token, raw), zh.replace(token, raw)
+        return en, zh
+
+    def body(item):
+        en, zh = values(item)
+        if item.get('action') == 'preserve':
+            return en
+        return zh if mode == 'B' else en + ('<br>' + zh if zh != en else '')
+
+    for item in items:
+        if item.get('kind') in ('table', 'table_caption', 'table_cell'):
+            group = tables.setdefault(_table_key(item), {'cells': [], 'captions': []})
+            group['cells' if item['kind'] == 'table_cell' else 'captions'].append(item)
+    for item in items:
+        kind = item.get('kind', 'sentence')
+        if kind in ('table', 'table_caption', 'table_cell'):
+            key = _table_key(item)
+            if key in rendered:
+                continue
+            rendered.add(key)
+            group = tables[key]
+            for caption in group['captions']:
+                out.append(body(caption))
+            cells = group['cells']
+            if not cells:
+                out.append('**DRAFT: table cells unavailable**')
+                continue
+            simple = all(c.get('rowspan', 1) == 1 and c.get('colspan', 1) == 1 for c in cells)
+            if simple:
+                grid = {(c.get('row', 0), c.get('col', 0)): c for c in cells}
+                rows = max(r for r, _ in grid) + 1
+                cols = max(c for _, c in grid) + 1
+                lines = []
+                for r in range(rows):
+                    row = [body(grid[(r, c)]).replace('|', r'\|').replace('\n', '<br>') if (r, c) in grid else '' for c in range(cols)]
+                    lines.append('| ' + ' | '.join(row) + ' |')
+                    if r == 0:
+                        lines.append('| ' + ' | '.join(['---'] * cols) + ' |')
+                out.append('\n'.join(lines))
+            else:
+                lines = ['<table>']
+                for r in sorted({c.get('row', 0) for c in cells}):
+                    lines.append('<tr>')
+                    for c in sorted((c for c in cells if c.get('row', 0) == r), key=lambda c: c.get('col', 0)):
+                        text = html.escape(body(c)).replace('&lt;br&gt;', '<br>')
+                        lines.append(f'<td rowspan="{c.get("rowspan", 1)}" colspan="{c.get("colspan", 1)}">{text}</td>')
+                    lines.append('</tr>')
+                lines.append('</table>')
+                out.append('\n'.join(lines))
+            continue
+        if kind in ('equation', 'math'):
+            if item.get('asset_id'):
+                path = asset_paths.get(item['asset_id'])
+                out.append(f'![Formula]({path})' if path else '**DRAFT: missing formula asset**')
+            elif item.get('math_format') == 'typst_math':
+                out.append('```typst\n$ ' + _math(item) + ' $\n```')
+            else:
+                raw = re.sub(r'^\\begin\{equation\*?\}|\\end\{equation\*?\}$', '', item.get('source', '')).strip().strip('$')
+                out.append('$$\n' + raw + '\n$$')
+            continue
+        if item.get('asset_id'):
+            path = asset_paths.get(item['asset_id'])
+            out.append(f'![{item["asset_id"]}]({path})' if path else '**DRAFT: missing graphic asset**')
+        if kind == 'code':
+            code = item.get('source', '')
+            longest = max((len(match.group()) for match in re.finditer(r'`+', code)), default=0)
+            fence = '`' * max(3, longest + 1)
+            out.append(fence + '\n' + code + '\n' + fence)
+            continue
+        prefix = '#' * _heading_level(item) + ' ' if kind in ('heading', 'title') else ''
+        out.append(prefix + body(item).replace('<br>', '\n\n'))
+    return '\n\n'.join(out) + '\n'
+
+
+def compile_typst(typst_file, output_pdf=None, generate_previews=False, ppi=150) -> bool:
+    pdf_out = output_pdf or str(Path(typst_file).with_suffix('.pdf'))
     try:
-        import typst
-        print(f"Compiling {typst_file} to {pdf_out} via Python typst...")
-        typst.compile(typst_file, output=pdf_out)
-
-        if generate_previews:
-            preview_pattern = os.path.splitext(pdf_out)[0] + "_page_{p}.png"
-            print(f"Rendering previews to {preview_pattern} at {ppi} PPI...")
-            typst.compile(typst_file, output=preview_pattern, format="png", ppi=ppi)
-
-        print("Typst compilation successful!")
-        return True
-    except ImportError:
-        # Fallback to typst CLI
-        cmd = ["typst", "compile", typst_file, pdf_out]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0:
-            print(f"Typst CLI compiled {pdf_out} successfully.")
-            return True
+        try:
+            import typst
+        except ImportError:
+            subprocess.run(['typst', 'compile', str(typst_file), str(pdf_out)], check=True, capture_output=True, text=True)
         else:
-            print(f"Typst compilation failed: {res.stderr}")
-            return False
-    except Exception as e:
-        print(f"Typst compilation error: {e}")
+            typst.compile(str(typst_file), output=str(pdf_out))
+        if generate_previews:
+            import pymupdf
+            with pymupdf.open(pdf_out) as doc:
+                for number, page in enumerate(doc, 1):
+                    page.get_pixmap(dpi=ppi).save(str(Path(pdf_out).with_suffix('')) + f'_page_{number}.png')
+        return True
+    except Exception as exc:
+        print(f'Typst compilation failed: {exc}', file=sys.stderr)
         return False
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compile paper manifest to Typst PDF")
-    parser.add_argument("manifest", help="Path to validated manifest.jsonl")
-    parser.add_argument(
-        "--mode",
-        default="A",
-        choices=["A", "B", "C", "D"],
-        help="Mode A: Bilingual Interlinear, Mode B: Full Chinese, Mode C: Paragraph Bilingual, Mode D: Dual Column"
-    )
-    parser.add_argument("--out-typ", default="output.typ", help="Output .typ path")
-    parser.add_argument("--out-pdf", default="output.pdf", help="Output .pdf path")
-    parser.add_argument("--previews", action="store_true", help="Generate PNG page previews")
+def compile_job(job_dir, mode='A', output_stage='candidate', previews=False):
+    ir = _ir()
+    if output_stage not in ('candidate', 'draft'):
+        raise RenderError('Only candidate or draft can be compiled; acceptance follows PDF verification')
+    root = Path(job_dir).resolve()
+    if output_stage == 'draft':
+        job = ir.load_job(root)
+        records = ir.load_translation_records(job) if (root / 'translations.jsonl').is_file() else []
+        targets = {r['id']: r['translation'] for r in records}
+        items = [{**row, 'translation': row['source'] if row['action'] == 'preserve' else targets.get(row['id'], '[UNTRANSLATED] ' + row['source'])} for row in job['source']]
+    else:
+        job = ir.load_merged_job(root, require_preflight=True)
+        items = job['merged']
+    bindings = ir.job_bindings(job)
+    directory = root / output_stage
+    directory.mkdir(parents=True, exist_ok=True)
+    materialized = []
+    asset_paths = {}
+    for asset in job['assets']:
+        source = ir.resolve_job_path(root, asset['path'])
+        if not source.is_file():
+            if output_stage == 'draft':
+                continue
+            raise RenderError(f'Missing asset: {source}')
+        destination = directory / 'assets' / (asset['sha256'] + source.suffix.lower())
+        destination.parent.mkdir(exist_ok=True)
+        shutil.copy2(source, destination)
+        relative = destination.relative_to(directory).as_posix()
+        materialized.append({**asset, 'path': relative})
+        asset_paths[asset['asset_id']] = relative
+    typ_path = directory / f'paper.{mode}.typ'
+    pdf_path = directory / f'paper.{mode}.pdf'
+    typ_path.write_text(render_typst_document(items, mode, {'output_stage': output_stage, 'assets': materialized, 'asset_root': str(directory)}, str(directory)), encoding='utf-8')
+    markdown_path = directory / f'paper.{mode}.md'
+    if output_stage == 'draft':
+        draft_items = [{**i, 'translation': _texts(i, True)[1]} for i in items]
+        markdown_path.write_text('DRAFT — not accepted\n\n' + export_markdown(draft_items, mode, asset_paths), encoding='utf-8')
+    else:
+        markdown_path.write_text(export_markdown(items, mode, asset_paths), encoding='utf-8')
+    if not compile_typst(typ_path, pdf_path, previews):
+        raise RenderError('Compilation failed; no candidate can be accepted')
+    segments, graphics, math_ids = expected_content(items, mode) if output_stage != 'draft' else ([], [], [])
+    report = {'schema_version': 3, 'status': output_stage, 'mode': mode, 'bindings': bindings,
+              'pdf_path': pdf_path.relative_to(root).as_posix(), 'pdf_hash': ir.file_hash(pdf_path),
+              'typ_path': typ_path.relative_to(root).as_posix(), 'typ_hash': ir.file_hash(typ_path),
+              'markdown_path': markdown_path.relative_to(root).as_posix(), 'markdown_hash': ir.file_hash(markdown_path),
+              'segments': segments, 'graphics': graphics, 'math_ids': math_ids,
+              'assets': [{**a, 'path': (directory / a['path']).relative_to(root).as_posix()} for a in materialized]}
+    ir.atomic_write_json(root / 'checks' / 'render_map.json', report)
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Compile a verified job to a PDF candidate, or an explicit legacy draft')
+    parser.add_argument('manifest', nargs='?')
+    parser.add_argument('--job-dir')
+    parser.add_argument('--mode', choices=list('ABCD'), default='A')
+    parser.add_argument('--output-stage', choices=['candidate', 'draft'], default='candidate')
+    parser.add_argument('--out-typ', default='output.typ')
+    parser.add_argument('--out-pdf', default='output.pdf')
+    parser.add_argument('--previews', action='store_true')
     args = parser.parse_args()
+    try:
+        if args.job_dir:
+            if args.manifest:
+                raise RenderError('Choose --job-dir or a legacy manifest, not both')
+            report = compile_job(args.job_dir, args.mode, args.output_stage, args.previews)
+            print(json.dumps({'status': report['status'], 'pdf_path': report['pdf_path']}, ensure_ascii=False))
+        else:
+            if not args.manifest or args.output_stage != 'draft':
+                raise RenderError('Production compilation requires --job-dir; legacy files require --output-stage draft')
+            items = _ir().read_jsonl(args.manifest)
+            out = Path(args.out_typ).resolve()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(render_typst_document(items, args.mode, {'output_stage': 'draft', 'asset_root': str(Path(args.manifest).resolve().parent)}, str(out.parent)), encoding='utf-8')
+            if not compile_typst(out, args.out_pdf, args.previews):
+                return 5
+        return 0
+    except (ValueError, OSError, KeyError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
-    items = []
-    with open(args.manifest, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                try:
-                    items.append(json.loads(line))
-                except json.JSONDecodeError as err:
-                    print(f"Error parsing JSON on line: {err}", file=sys.stderr)
-                    sys.exit(1)
 
-    typ_dir = os.path.dirname(os.path.abspath(args.out_typ)) or "."
-    content = render_typst_document(items, mode=args.mode, typ_dir=typ_dir, metadata={"manifest_path": args.manifest})
-    with open(args.out_typ, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    success = compile_typst(args.out_typ, output_pdf=args.out_pdf, generate_previews=args.previews)
-    if not success:
-        sys.exit(1)
-    sys.exit(0)
+if __name__ == '__main__':
+    raise SystemExit(main())

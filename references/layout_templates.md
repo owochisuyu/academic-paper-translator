@@ -1,121 +1,42 @@
-# Typst Academic Paper Layout Templates
+# Layout and output verification
 
-This reference documents the publication-grade Typst layout templates for compiling academic papers into bilingual interlinear, pure Chinese, or dual-column editions.
+`compile_typst.py --job-dir JOB --mode A --output-stage candidate` consumes a canonical merged job and its current preflight report. The compiler checks input bindings again; legacy JSONL can only be compiled with explicit `--output-stage draft`.
 
----
+| Mode | Actual presentation |
+| --- | --- |
+| A | Each source sentence followed by its target sentence. Preserved units appear once. |
+| B | Target text for every translatable kind; explicitly preserved source remains. |
+| C | Adjacent ordinary text with the same parent_id is grouped as one source/target paragraph. Protected TeX units retain their individual mapping. |
+| D | A two-cell table for each corresponding paragraph, with English at left and Chinese at right. Long rows can continue across pages. |
 
-## 1. Bilingual Interlinear Template (Mode A: 逐句交替精读模板)
+A/C bilingual pairs are measured at their actual column width. Pairs up to 45mm high stay on one page; longer pairs may continue across pages so a large paragraph does not overflow.
 
-```typst
-#set page(
-  paper: "a4",
-  margin: (top: 2.2cm, bottom: 2.2cm, left: 2.0cm, right: 2.0cm),
-  header: context {
-    if counter(page).get().first() > 1 [
-      #text(size: 8pt, fill: luma(100))[
-        #grid(
-          columns: (1fr, 1fr),
-          align(left)[_Journal Name_ (2026)],
-          align(right)[Authors | Title (中英双语精读对照)]
-        )
-        #v(-4pt)
-        #line(length: 100%, stroke: 0.5pt + luma(180))
-      ]
-    ]
-  },
-  footer: context [
-    #text(size: 8.5pt, fill: luma(120))[
-      #align(center)[- #counter(page).display() -]
-    ]
-  ]
-)
+The low-level `render_typst_document()` function is a preview API. Its default output is visibly marked DRAFT. It never searches the current directory for assets. A figure needs an exact asset ID or, for legacy drafts only, an explicit image path.
 
-#set text(font: ("Times New Roman", "Microsoft YaHei", "SimSun"), size: 9.5pt, lang: "zh")
-#set par(justify: true, leading: 0.78em)
-#set math.equation(numbering: "(1)")
+Ordinary strings are emitted using Typst string literals, so source/target text cannot execute Typst code. Unknown kinds and unsupported mathematical syntax are errors. The limited LaTeX converter handles equation, frac, sqrt, arithmetic, selected Greek symbols and operators. It does not support arbitrary macros or align environments. Graphic formulas retain their source image. Protected inline TeX math uses this same bounded converter; cite/ref tokens are shown with their keys in the Typst reading copy. Use the original LaTeX route for resolved bibliography and cross-reference numbering.
 
-// 逐句对排版宏 (Interlinear Pair)
-#let bip(en, zh) = [
-  #block(
-    width: 100%,
-    inset: (left: 0pt, right: 0pt, top: 1.5pt, bottom: 1.5pt),
-    [
-      #text(fill: luma(20), size: 9.5pt)[#en] \
-      #v(1.5pt)
-      #text(fill: rgb("#1a4b77"), size: 9.2pt, font: ("Microsoft YaHei", "SimSun"))[#zh]
-    ]
-  )
-  #v(2.5pt)
-]
+Markdown units also restore delimited inline `$...$` and `\(...\)` math through the bounded converter. Backtick code spans and ordinary currency stay literal. Unknown TeX macros and ambiguous/unclosed math require correction. Simple arithmetic and subscript/superscript formulas have a normalized glyph check against the actual PDF; complex formulas still require visual review because PDF extraction cannot prove their arrangement.
 
-// 纯中文段落宏 (Mode B)
-#let zhp(zh) = [
-  #block(
-    width: 100%,
-    inset: (left: 0pt, right: 0pt, top: 1.5pt, bottom: 1.5pt),
-    [
-      #text(fill: luma(15), size: 9.5pt, font: ("Microsoft YaHei", "SimSun"))[#zh]
-    ]
-  )
-  #v(2.5pt)
-]
+The Markdown export uses the same merged records, with table grids, HTML spans where necessary, protected source formulas, and relative image links. Candidate assets are copied beside the output so the PDF, Typst, Markdown and assets can be moved together.
 
-// 一级标题宏
-#let h1(en, zh) = [
-  #v(16pt, weak: true)
-  #text(size: 13pt, weight: "bold")[#en] \
-  #v(1.5pt)
-  #text(size: 11.5pt, weight: "bold", fill: rgb("#1a4b77"))[#zh]
-  #v(8pt, weak: true)
-]
+## Actual output checks
 
-// 二级标题宏
-#let h2(en, zh) = [
-  #v(12pt, weak: true)
-  #text(size: 11pt, weight: "bold")[#en] \
-  #v(1.0pt)
-  #text(size: 10pt, weight: "bold", fill: rgb("#1a4b77"))[#zh]
-  #v(6pt, weak: true)
-]
+Run `python scripts/verify_output.py --job-dir JOB` after compilation. It reopens the PDF, checks normalized text occurrences, required image fingerprints and text outside page boundaries, and renders every page into `checks/previews/PDF_SHA256/`. The report's `preview_dir` points to the current PDF's pages. It also rechecks copied portable assets and compares Markdown with the canonical merged export.
+
+Text extraction alone cannot detect all hidden or overlapping content. Inspect every generated preview and compare source figures/formulas where needed. Record the actual assessment in `reviews/visual.json`:
+
+```json
+{
+  "pdf_hash": "actual SHA-256 from checks/render_map.json",
+  "page_count": 2,
+  "reviewed_pages": [1, 2],
+  "reviewer": {"name": "actual reviewer", "method": "agent or human"},
+  "checks": ["layout", "graphics", "math", "text_visibility"],
+  "status": "PASS",
+  "findings": []
+}
 ```
 
----
+Do not fill a review automatically from an exit code. Any unresolved finding or unreviewed page prevents acceptance. Rerun the verifier after review; only a current candidate with successful checks is copied to `deliverables/`. Changed PDF, source, translations, reviews, assets or glossary invalidate the corresponding result.
 
-## 2. Dual-Column Parallel Layout Template (Mode D: 左右双栏平行对照)
-
-```typst
-#set page(
-  paper: "a4",
-  flipped: true, // A4 Landscape
-  margin: (top: 2.0cm, bottom: 2.0cm, left: 1.8cm, right: 1.8cm),
-)
-
-#grid(
-  columns: (1fr, 1fr),
-  column-gutter: 2.5cm,
-  [
-    #set text(lang: "en", size: 9pt)
-    #align(center)[#text(size: 13pt, weight: "bold")[English Original Text]]
-    // English content stream
-  ],
-  [
-    #set text(lang: "zh", size: 9pt)
-    #align(center)[#text(size: 13pt, weight: "bold", fill: rgb("#1a4b77"))[学术中文对照全译]]
-    // Chinese content stream
-  ]
-)
-```
-
----
-
-## 3. Typst Compilation Workflow in Python
-
-```python
-import typst
-
-# Compile directly to PDF:
-typst.compile("paper.typ", output="paper.pdf")
-
-# Generate high-resolution page previews (200 PPI):
-typst.compile("paper.typ", output="preview_page_{p}.png", format="png", ppi=200)
-```
+Pixel fingerprints establish approximate raster-image identity, not source crop correctness. Vector graphics and mathematical presentation remain explicit visual-review items. Reflow changes page counts; matching the original page count is not an acceptance condition.

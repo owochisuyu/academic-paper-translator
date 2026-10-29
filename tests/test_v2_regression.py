@@ -94,7 +94,7 @@ class TestV2CompilerRegression(unittest.TestCase):
 
     def test_figure_without_image_path_compiles(self):
         items = [{"kind": "figure", "id": "fig-1", "source": "Fig. 1. Result.", "translation": "图 1. 结果。"}]
-        rendered = render_typst_document(items, mode="A")
+        rendered = render_typst_document(items, mode="A", metadata={"output_stage": "draft"})
         typ_path = os.path.join(self.test_dir, "test_fig.typ")
         pdf_path = os.path.join(self.test_dir, "test_fig.pdf")
         with open(typ_path, "w", encoding="utf-8") as f:

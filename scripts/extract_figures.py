@@ -12,6 +12,8 @@ import os
 import re
 import argparse
 import json
+import hashlib
+from pathlib import Path
 import pymupdf
 
 # Regex matching standard and appendix figures:
@@ -40,7 +42,9 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
     Returns:
         List of metadata dicts describing each extracted figure.
     """
+    output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    doc_id = hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
     doc = pymupdf.open(pdf_path)
     extracted_figures = []
 
@@ -246,11 +250,20 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
             # Render at specified DPI
             pix = page.get_pixmap(clip=final_fig_rect, dpi=dpi)
             clean_id = sanitize_filename(fig_id)
-            out_filename = f"fig_{clean_id}.png"
+            occurrence = sum(f["figure_id"] == fig_id and f["page"] == pno + 1 for f in extracted_figures) + 1
+            already_used = any(f["figure_id"] == fig_id for f in extracted_figures)
+            out_filename = f"p{pno + 1:03d}_fig_{clean_id}_{occurrence}.png" if already_used else f"fig_{clean_id}.png"
             out_path = os.path.join(output_dir, out_filename)
             pix.save(out_path)
 
             extracted_figures.append({
+                "asset_id": f"{doc_id[:16]}:p{pno + 1:03d}:figure:{fig_id}:{occurrence}",
+                "doc_id": doc_id,
+                "kind": "figure",
+                "representation": "raster",
+                "sha256": hashlib.sha256(Path(out_path).read_bytes()).hexdigest(),
+                "path": out_path,
+                "owner_ids": [],
                 "figure_id": fig_id,
                 "page": pno + 1,
                 "caption": cap["text"],
@@ -266,11 +279,9 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
 
     # Save figures manifest JSON for downstream alignment and compilation
     manifest_path = os.path.join(output_dir, "figures_manifest.json")
-    try:
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(extracted_figures, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Warning: could not write figures manifest: {e}")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(extracted_figures, f, indent=2, ensure_ascii=False)
+    doc.close()
 
     print(f"Extracted {len(extracted_figures)} figures to {output_dir}")
     return extracted_figures

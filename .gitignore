@@ -8,3 +8,7 @@ coverage_report.json
 report*.json
 *.png
 *.pdf
+
+.venv/
+runs/
+*.log
