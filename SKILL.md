@@ -22,7 +22,7 @@ Translate academic papers into publication-standard Chinese or sentence-by-sente
    * **Mode B**: Full Chinese publication PDF & Markdown (纯中文出版级全译版).
    * **Mode C**: Paragraph-level bilingual (段落级交替对照).
    * **Mode D**: Dual-column parallel layout (左右双栏平行对照).
-3. **Zero-Omission ID-Manifest Protocol**: Every extracted sentence, equation, table cell, and caption receives a deterministic unique ID (e.g. `sec01-p002-b005-s001`). Translation occurs strictly against this manifest, mathematically eliminating silent sentence drops.
+3. **Strict ID-Manifest Protocol & Verification**: Every extracted sentence, equation, table cell, and caption receives a deterministic unique ID (e.g. `sec01-p002-b005-s001`). Translation occurs strictly against this manifest to ensure 100% item mapping and bijection, preventing manifest-level omissions and tracking translation completeness through two-tier QA validation.
 4. **Geometry-Aware Figure Extraction**: True graphic bounding box computation via PyMuPDF vector drawing paths and bitmap objects, preventing internal axis/legend text from truncating figures.
 5. **Two-Tier Quality Assurance Engine**:
    * *Tier 1*: Source text layer coverage verification.

@@ -147,7 +147,7 @@ def escape_typst_content(text: str) -> str:
     return res
 
 
-def render_typst_document(manifest_items: list[dict], mode: str = "A", metadata: dict = None) -> str:
+def render_typst_document(manifest_items: list[dict], mode: str = "A", metadata: dict = None, typ_dir: str = ".") -> str:
     """
     Renders manifest items into Typst source code.
     mode:
@@ -234,6 +234,88 @@ def render_typst_document(manifest_items: list[dict], mode: str = "A", metadata:
             cap_en = en
             cap_zh = zh
 
+            clean_no = re.sub(r'[^A-Za-z0-9_.-]', '_', str(fig_no))
+
+            # Helper to check if a file path is valid
+            def resolve_img_file(path_cand):
+                if not path_cand:
+                    return None
+                # Check directly
+                if os.path.isfile(path_cand):
+                    return os.path.abspath(path_cand)
+                # Check relative to typ_dir
+                cand_typ = os.path.join(typ_dir, path_cand)
+                if os.path.isfile(cand_typ):
+                    return os.path.abspath(cand_typ)
+                # Check relative to cwd
+                cand_cwd = os.path.abspath(path_cand)
+                if os.path.isfile(cand_cwd):
+                    return cand_cwd
+                return None
+
+            resolved_path = resolve_img_file(fig_path)
+
+            # If not found directly, discover from figures_manifest.json or common paths
+            if not resolved_path:
+                manifest_search_roots = [typ_dir, "."]
+                if "manifest_path" in meta:
+                    manifest_search_roots.append(os.path.dirname(os.path.abspath(meta["manifest_path"])))
+
+                # Collect all figures_manifest.json files
+                found_manifests = []
+                for s_root in manifest_search_roots:
+                    if not os.path.isdir(s_root):
+                        continue
+                    for root, dirs, files in os.walk(s_root):
+                        rel_parts = os.path.relpath(root, s_root).split(os.sep)
+                        if len(rel_parts) > 3:
+                            dirs.clear()
+                            continue
+                        if "figures_manifest.json" in files:
+                            found_manifests.append(os.path.join(root, "figures_manifest.json"))
+
+                for mf_path in found_manifests:
+                    mf_dir = os.path.dirname(os.path.abspath(mf_path))
+                    try:
+                        with open(mf_path, "r", encoding="utf-8") as mf:
+                            fig_list = json.load(mf)
+                            for f_entry in fig_list:
+                                e_id = str(f_entry.get("figure_id", ""))
+                                e_path = f_entry.get("image_path", "")
+                                if e_id == str(fig_no) or clean_no in e_path:
+                                    # Candidate locations for this image
+                                    cands = [
+                                        e_path,
+                                        os.path.join(mf_dir, os.path.basename(e_path)),
+                                        os.path.join(mf_dir, f"fig_{clean_no}.png"),
+                                        os.path.join(mf_dir, f"fig_{e_id}.png")
+                                    ]
+                                    for c in cands:
+                                        res = resolve_img_file(c)
+                                        if res:
+                                            resolved_path = res
+                                            break
+                                if resolved_path:
+                                    break
+                    except Exception:
+                        pass
+                    if resolved_path:
+                        break
+
+            # Fallback check common naming conventions
+            if not resolved_path:
+                common_cands = [
+                    f"paper_figures/fig_{clean_no}.png",
+                    f"figures/fig_{clean_no}.png",
+                    f"column-figures/fig_{clean_no}.png",
+                    f"fig_{clean_no}.png"
+                ]
+                for c in common_cands:
+                    res = resolve_img_file(c)
+                    if res:
+                        resolved_path = res
+                        break
+
             # Strip redundant 'Fig. X' prefix from caption text if already in fig_no
             clean_cap_en = re.sub(r'^(?:Fig\.|Figure|Supplementary\s+Figure)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', cap_en, flags=re.I).strip()
             clean_cap_zh = re.sub(r'^(?:图|附图)\s*[A-Za-z0-9_.-]*[:.]?\s*', '', cap_zh).strip()
@@ -242,12 +324,10 @@ def render_typst_document(manifest_items: list[dict], mode: str = "A", metadata:
             if not clean_cap_zh:
                 clean_cap_zh = cap_zh
 
-            # If figure image file actually exists on disk, render image; else render clean placeholder box
-            has_image = fig_path and os.path.isfile(fig_path)
-            if has_image:
-                # Normalize slashes for Typst
-                norm_fig_path = Path(fig_path).as_posix()
-                img_block = f'image("{norm_fig_path}", width: 85%)'
+            # Typst requires relative paths to the .typ file directory
+            if resolved_path and os.path.isfile(resolved_path):
+                rel_fig_path = os.path.relpath(resolved_path, typ_dir).replace('\\', '/')
+                img_block = f'image("{rel_fig_path}", width: 85%)'
             else:
                 img_block = (
                     f'rect(width: 85%, height: 60pt, stroke: 0.5pt + luma(180), fill: luma(250))[\n'
@@ -270,33 +350,42 @@ def render_typst_document(manifest_items: list[dict], mode: str = "A", metadata:
             i += 1
 
         elif kind in ("table", "table_cell"):
-            # Collect this table and all its cells (whether table comes before cells or after)
+            # Render a single table grouped strictly by table_id
             tbl_caption_en = ""
             tbl_caption_zh = ""
             tbl_code = None
             tbl_cells = []
 
-            # Check if this item is table caption or cell
             if kind == "table":
                 tbl_caption_en = en
                 tbl_caption_zh = zh
                 tbl_code = item.get("typst_code")
+                active_tbl_id = item.get("table_id") or item.get("id", "").replace("-cap", "")
                 i += 1
-                # Collect following consecutive table_cells
+                # Collect following table_cells belonging strictly to THIS table
                 while i < n and manifest_items[i].get("kind") == "table_cell":
+                    cell_tbl_id = manifest_items[i].get("table_id")
+                    if active_tbl_id and cell_tbl_id and cell_tbl_id != active_tbl_id:
+                        break
                     tbl_cells.append(manifest_items[i])
                     i += 1
             else:
-                # Starting with table_cell, collect all consecutive table_cells
+                # Starting with table_cell, collect cells with the SAME table_id
+                active_tbl_id = item.get("table_id")
                 while i < n and manifest_items[i].get("kind") == "table_cell":
+                    cell_tbl_id = manifest_items[i].get("table_id")
+                    if active_tbl_id and cell_tbl_id and cell_tbl_id != active_tbl_id:
+                        break
                     tbl_cells.append(manifest_items[i])
                     i += 1
-                # Check if immediately followed by table caption
+                # Check if immediately followed by matching table caption
                 if i < n and manifest_items[i].get("kind") == "table":
-                    tbl_caption_en = manifest_items[i].get("source", "").strip()
-                    tbl_caption_zh = manifest_items[i].get("translation", "").strip() or tbl_caption_en
-                    tbl_code = manifest_items[i].get("typst_code")
-                    i += 1
+                    cell_tbl_id = manifest_items[i].get("table_id")
+                    if not active_tbl_id or not cell_tbl_id or cell_tbl_id == active_tbl_id:
+                        tbl_caption_en = manifest_items[i].get("source", "").strip()
+                        tbl_caption_zh = manifest_items[i].get("translation", "").strip() or tbl_caption_en
+                        tbl_code = manifest_items[i].get("typst_code")
+                        i += 1
 
             if tbl_code:
                 body_lines.append(f"\n{tbl_code}\n")
@@ -451,7 +540,8 @@ if __name__ == "__main__":
                     print(f"Error parsing JSON on line: {err}", file=sys.stderr)
                     sys.exit(1)
 
-    content = render_typst_document(items, mode=args.mode)
+    typ_dir = os.path.dirname(os.path.abspath(args.out_typ)) or "."
+    content = render_typst_document(items, mode=args.mode, typ_dir=typ_dir, metadata={"manifest_path": args.manifest})
     with open(args.out_typ, "w", encoding="utf-8") as f:
         f.write(content)
 

@@ -29,12 +29,56 @@ from datetime import datetime, timezone
 import pymupdf
 
 
-# Exact number entity token regex
+# Canonical unit definitions: (canonical_id, [list of alias patterns])
+# Longer / compound forms are placed first to guarantee longest-match tokenization.
+UNIT_PATTERNS = [
+    ("km/h", [r'km/h', r'公里/小时', r'千米/小时']),
+    ("m/s", [r'm/s', r'米/秒']),
+    ("kHz", [r'kHz', r'千赫兹?', r'千赫']),
+    ("MHz", [r'MHz', r'兆赫兹?', r'兆赫']),
+    ("GHz", [r'GHz', r'吉赫兹?', r'吉赫']),
+    ("dBm", [r'dBm']),
+    ("deg", [r'deg', r'度']),
+    ("rad", [r'rad', r'弧度']),
+    ("min", [r'min', r'分钟']),
+    ("mm", [r'mm', r'毫米']),
+    ("cm", [r'cm', r'厘米']),
+    ("km", [r'km', r'千米', r'公里']),
+    ("ms", [r'ms', r'毫秒']),
+    ("ns", [r'ns', r'纳秒']),
+    ("mV", [r'mV', r'毫伏']),
+    ("mA", [r'mA', r'毫安']),
+    ("kW", [r'kW', r'千瓦']),
+    ("mW", [r'mW', r'毫瓦']),
+    ("dB", [r'dB', r'分贝']),
+    ("mg", [r'mg', r'毫克']),
+    ("kg", [r'kg', r'千克', r'公斤']),
+    ("Hz", [r'Hz', r'赫兹?', r'赫']),
+    ("m", [r'm(?![a-zA-Z])', r'米(?![a-zA-Z秒])']),
+    ("s", [r's(?![a-zA-Z])', r'秒(?![a-zA-Z])']),
+    ("h", [r'h(?![a-zA-Z])', r'hr(?![a-zA-Z])', r'小时']),
+    ("V", [r'V(?![a-zA-Z])', r'伏特?', r'伏']),
+    ("A", [r'A(?![a-zA-Z])', r'安培?', r'安']),
+    ("W", [r'W(?![a-zA-Z])', r'瓦特?', r'瓦']),
+    ("g", [r'g(?![a-zA-Z])', r'克']),
+    ("°", [r'°', r'度']),
+    ("%", [r'%', r'百分之', r'个百分点']),
+]
+
+# All English unit symbols sorted by length descending so that prefixes never shadow longer units
+ALL_UNITS_SORTED = [
+    "km/h", "m/s", "kHz", "MHz", "GHz", "dBm", "deg", "rad", "min",
+    "mm", "cm", "km", "ms", "ns", "mV", "mA", "kW", "mW", "dB", "mg", "kg", "Hz",
+    "m", "s", "h", "V", "A", "W", "g", "°", "%"
+]
+UNITS_EN_PATTERN = "|".join(re.escape(u) for u in ALL_UNITS_SORTED)
+
+# Exact number entity token regex: preserves bound units and prevents prefix truncation (e.g. 10 ms not 10 m)
 NUM_ENTITY_REGEX = re.compile(
     r'(?:'
     r'([+-]?\d+(?:\.\d+)?)\s*(?:\\times|x|\*|×)\s*10\^?\{?([+-]?\d+)\}?|'  # scientific: 1.5 \times 10^{-3}
     r'([+-]?\d+(?:\.\d+)?)[eE]([+-]?\d+)|'                                  # exponential: 1.5e-3
-    r'([+-]?\d+(?:\.\d+)?)\s*(km/h|m/s|mm|cm|km|m|ns|ms|s|kHz|MHz|GHz|Hz|dBm|dB|mg|kg|g|mV|V|mA|A|kW|mW|W|rad|deg|°|%)|' # with unit
+    rf'([+-]?\d+(?:\.\d+)?)\s*({UNITS_EN_PATTERN})(?![a-zA-Z])|'          # with physical unit
     r'([+-]?\d+\.\d+)|'                                                      # float
     r'([+-]?\d+)'                                                            # int
     r')'
@@ -43,6 +87,27 @@ NUM_ENTITY_REGEX = re.compile(
 # Number token extractor for target text
 TARGET_NUM_REGEX = re.compile(r'(?<![a-zA-Z0-9_.])([+-]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)(?![a-zA-Z0-9_]|\.\d)')
 TARGET_SCI_REGEX = re.compile(r'([+-]?\d+(?:\.\d+)?)\s*(?:\\times|x|\*|×)\s*10\^?\{?([+-]?\d+)\}?')
+
+# Flattened list of (alias_regex, canonical_name) sorted by pattern length descending
+ALIAS_TO_CANONICAL = []
+for _canon, _aliases in UNIT_PATTERNS:
+    for _al in _aliases:
+        ALIAS_TO_CANONICAL.append((_al, _canon))
+ALIAS_TO_CANONICAL.sort(key=lambda x: len(x[0]), reverse=True)
+
+_unit_rx_parts = [f'(?P<u_{i}>{pat})' for i, (pat, _) in enumerate(ALIAS_TO_CANONICAL)]
+_combined_unit_rx = '|'.join(_unit_rx_parts)
+
+NUM_RX_COMBINED = re.compile(
+    r'(?<![a-zA-Z0-9_.])'
+    r'('
+    r'([+-]?\d+(?:\.\d+)?)\s*(?:\\times|x|\*|×)\s*10\^?\{?([+-]?\d+)\}?|'
+    r'([+-]?\d+(?:\.\d+)?)[eE]([+-]?\d+)|'
+    r'([+-]?\d+\.\d+)|'
+    r'([+-]?\d+)'
+    r')'
+    rf'(?:\s*(?:{_combined_unit_rx}))?'
+)
 
 # Regex for bracket citations: [1], [1, 2], [1-3], [4]--[7]
 BRACKET_CITATION_REGEX = re.compile(
@@ -91,7 +156,71 @@ UNIT_SPECS = [
     ("deg", [re.compile(r'\bdeg\b', re.I), re.compile(r'度'), re.compile(r'°')]),
     ("°", [re.compile(r'°'), re.compile(r'度')]),
     ("%", [re.compile(r'%'), re.compile(r'百分之'), re.compile(r'个百分点')]),
+    ("rad", [re.compile(r'\brad\b', re.I), re.compile(r'弧度')]),
+    ("v", [re.compile(r'(?<![a-zA-Z])V(?![a-zA-Z])'), re.compile(r'伏(?:特)?')]),
+    ("mv", [re.compile(r'\bmV\b', re.I), re.compile(r'毫伏')]),
+    ("a", [re.compile(r'(?<![a-zA-Z])A(?![a-zA-Z])'), re.compile(r'安(?:培)?')]),
+    ("ma", [re.compile(r'\bmA\b', re.I), re.compile(r'毫安')]),
+    ("kw", [re.compile(r'\bkW\b', re.I), re.compile(r'千瓦')]),
+    ("mw", [re.compile(r'\bmW\b', re.I), re.compile(r'毫瓦')]),
+    ("w", [re.compile(r'(?<![a-zA-Z])W(?![a-zA-Z])'), re.compile(r'瓦(?:特)?')]),
 ]
+
+
+def extract_numeric_entities(text: str) -> list[dict]:
+    r"""
+    Extracts bound numeric entities (value, canonical_unit, raw_token, full_match).
+    Masks out math formulas ($...$ and \(...\)) and bracket citations ([1]) first
+    to avoid spurious token extraction.
+    """
+    # 1. Mask math formulas
+    text_clean = re.sub(r'\$[^\$]+\$', lambda m: ' ' * len(m.group(0)), text)
+    text_clean = re.sub(r'\\\([^\)]+\\\)', lambda m: ' ' * len(m.group(0)), text_clean)
+    # 2. Mask bracket citations [1], [1, 2]
+    text_clean = re.sub(r'\[\s*\d+(?:\s*(?:,\s*|[-–—])\s*\d+)*\s*\]', lambda m: ' ' * len(m.group(0)), text_clean)
+
+    entities = []
+    for m in NUM_RX_COMBINED.finditer(text_clean):
+        full_tok = m.group(1).strip()
+        sci_base, sci_exp = m.group(3), m.group(4)
+        e_base, e_exp = m.group(5), m.group(6)
+        flt = m.group(7)
+        itg = m.group(8)
+        val = None
+        if sci_base is not None and sci_exp is not None:
+            try:
+                val = float(sci_base) * (10 ** int(sci_exp))
+            except ValueError:
+                pass
+        elif e_base is not None and e_exp is not None:
+            try:
+                val = float(e_base) * (10 ** int(e_exp))
+            except ValueError:
+                pass
+        elif flt is not None:
+            try:
+                val = float(flt)
+            except ValueError:
+                pass
+        elif itg is not None:
+            try:
+                val = float(itg)
+            except ValueError:
+                pass
+
+        matched_unit = None
+        for i, (pat, canon) in enumerate(ALIAS_TO_CANONICAL):
+            if m.group(f'u_{i}') is not None:
+                matched_unit = canon
+                break
+
+        entities.append({
+            "value": val,
+            "unit": matched_unit,
+            "token": full_tok,
+            "raw": m.group(0).strip()
+        })
+    return entities
 
 
 def load_manifest(source_path: str) -> list[dict]:
@@ -236,13 +365,20 @@ class TranslationValidator:
                     for p in missing_pages:
                         page = doc[p - 1]
                         txt = page.get_text().strip()
-                        if len(txt) > 30:
+                        has_imgs = len(page.get_images()) > 0
+                        has_draws = len(page.get_drawings()) > 0
+                        if len(txt) > 0:
                             actual_missing.append(p)
+                        elif has_imgs or has_draws:
+                            actual_missing.append(p)
+                            tier1_report["details"].append(
+                                f"Page {p} contains image/drawing content with 0 text layer extracted (requires OCR or figure extraction)."
+                            )
 
                     if actual_missing:
                         tier1_report["missing_pages"] = actual_missing
                         tier1_report["status"] = "FAIL"
-                        tier1_report["details"].append(f"Pages with readable text not extracted: {actual_missing}")
+                        tier1_report["details"].append(f"Pages with unextracted content: {actual_missing}")
 
                     # Calculate character coverage ratio
                     raw_text_len = sum(len(doc[p].get_text().strip()) for p in range(total_pdf_pages))
@@ -259,7 +395,7 @@ class TranslationValidator:
                             tier1_report["details"].append("PDF contains 0 text characters across all pages.")
                         return tier1_report
 
-                    ratio = round(source_text_len / raw_text_len, 4)
+                    ratio = round(source_text_len / raw_text_len, 4) if raw_text_len > 0 else 0.0
                     tier1_report["char_coverage_ratio"] = ratio
 
                     # Strict coverage check: require >= 90% character coverage in strict mode
@@ -270,17 +406,52 @@ class TranslationValidator:
                             f"Low character coverage ratio: {ratio * 100:.1f}% (required >= {req_ratio * 100:.1f}%)"
                         )
 
-                    # Block accounting: check if major text blocks were dropped
-                    total_major_blocks = 0
-                    for p in range(total_pdf_pages):
-                        b_list = doc[p].get_text("blocks")
-                        major_blocks = [b for b in b_list if b[4].strip() and len(b[4].strip()) > 35]
-                        total_major_blocks += len(major_blocks)
+                    # Block-level coverage check: ensure every substantial text block is represented
+                    unextracted_blocks = []
+                    for pno in range(total_pdf_pages):
+                        page = doc[pno]
+                        b_list = page.get_text("blocks")
+                        # Items on this page
+                        p_items = [it for it in source_items if it.get("page") == pno + 1]
+                        if not p_items:
+                            p_items = source_items
+                        p_source_concat = " ".join(it.get("source", "") for it in p_items)
+                        p_source_norm = re.sub(r'\s+', ' ', p_source_concat).lower()
 
-                    if total_major_blocks > 0 and len(source_items) < total_major_blocks:
+                        # Detect tables to skip table text blocks
+                        table_rects = []
+                        try:
+                            tabs = page.find_tables()
+                            table_rects = [pymupdf.Rect(t.bbox) for t in tabs.tables]
+                        except Exception:
+                            pass
+
+                        for b in b_list:
+                            # Ignore non-text blocks
+                            if b[6] != 0:
+                                continue
+                            b_rect = pymupdf.Rect(b[:4])
+                            if any((b_rect & tr).get_area() > 0.5 * b_rect.get_area() for tr in table_rects):
+                                continue
+                            clean_b = re.sub(r'\s+', ' ', b[4]).strip()
+                            if len(clean_b) < 25:
+                                continue
+                            b_words = [w.lower() for w in re.findall(r'\b\w+\b', clean_b)]
+                            if not b_words:
+                                continue
+                            matches = sum(1 for w in b_words if w in p_source_norm)
+                            cov = matches / len(b_words)
+                            if cov < 0.40:
+                                unextracted_blocks.append({
+                                    "page": pno + 1,
+                                    "text": clean_b[:80]
+                                })
+
+                    if unextracted_blocks:
+                        tier1_report["unextracted_blocks"] = unextracted_blocks
                         tier1_report["status"] = "FAIL"
                         tier1_report["details"].append(
-                            f"Extracted items ({len(source_items)}) is less than detected document text blocks ({total_major_blocks}). Possible unextracted paragraphs."
+                            f"Detected {len(unextracted_blocks)} text block(s) omitted from extraction."
                         )
 
                 except Exception as e:
@@ -335,120 +506,63 @@ class TranslationValidator:
                 })
                 continue
 
-            # 1. Numerical & Unit Preservation Check (Exact Token Matching)
-            # Find all numbers in target text (both standard and scientific notation)
-            tgt_num_tokens = TARGET_NUM_REGEX.findall(tgt_text)
-            tgt_num_values = []
-            for t_tok in tgt_num_tokens:
-                try:
-                    tgt_num_values.append((t_tok, float(t_tok)))
-                except ValueError:
-                    tgt_num_values.append((t_tok, None))
+            # 1. Numerical & Unit Preservation Check (Bound Entity Multiset Matching)
+            src_entities = extract_numeric_entities(src_text)
+            tgt_entities = extract_numeric_entities(tgt_text)
+            remaining_tgt = list(tgt_entities)
 
-            for m in TARGET_SCI_REGEX.finditer(tgt_text):
-                b_str, e_str = m.groups()
-                try:
-                    t_val = float(b_str) * (10 ** int(e_str))
-                    tgt_num_values.append((f"{b_str}e{e_str}", t_val))
-                except ValueError:
-                    pass
+            for s_ent in src_entities:
+                s_val = s_ent["value"]
+                s_unit = s_ent["unit"]
+                s_tok = s_ent["token"]
+                s_raw = s_ent["raw"]
 
-            # Parse numbers and units from source
-            for m in NUM_ENTITY_REGEX.finditer(src_text):
-                raw_num = m.group(0).strip()
-                groups = m.groups()
+                found_idx = None
+                for idx, t_ent in enumerate(remaining_tgt):
+                    t_val = t_ent["value"]
+                    t_unit = t_ent["unit"]
+                    t_tok = t_ent["token"]
 
-                expected_val = None
-                expected_token = raw_num
-                expected_unit = None
-
-                # 1) Scientific notation: base * 10^exp
-                if groups[0] is not None and groups[1] is not None:
-                    base_str, exp_str = groups[0], groups[1]
-                    try:
-                        expected_val = float(base_str) * (10 ** int(exp_str))
-                        expected_token = f"{base_str}e{exp_str}"
-                    except ValueError:
-                        pass
-                # 2) Exponential notation: base e exp
-                elif groups[2] is not None and groups[3] is not None:
-                    base_str, exp_str = groups[2], groups[3]
-                    try:
-                        expected_val = float(base_str) * (10 ** int(exp_str))
-                        expected_token = f"{base_str}e{exp_str}"
-                    except ValueError:
-                        pass
-                # 3) With physical unit
-                elif groups[4] is not None and groups[5] is not None:
-                    base_str, unit_str = groups[4], groups[5]
-                    try:
-                        expected_val = float(base_str)
-                        expected_token = base_str
-                    except ValueError:
-                        pass
-                    expected_unit = unit_str
-                # 4) Float or Int
-                elif groups[6] is not None:
-                    expected_token = groups[6]
-                    try:
-                        expected_val = float(expected_token)
-                    except ValueError:
-                        pass
-                elif groups[7] is not None:
-                    expected_token = groups[7]
-                    try:
-                        expected_val = float(expected_token)
-                    except ValueError:
-                        pass
-
-                # Check numerical value existence in target tokens
-                matched_num = False
-                for t_tok, t_val in tgt_num_values:
-                    # Value equality check
-                    if expected_val is not None and t_val is not None:
-                        # Check sign strictly: negative cannot match positive
-                        if (expected_val < 0 and t_val > 0) or (expected_val > 0 and t_val < 0):
+                    # Check unit match: if source has a unit, target must match canonical unit
+                    if s_unit is not None:
+                        if t_unit is None or s_unit.lower() != t_unit.lower():
                             continue
-                        if math.isclose(expected_val, t_val, rel_tol=1e-5, abs_tol=1e-7):
-                            matched_num = True
-                            break
-                    elif expected_token == t_tok:
-                        matched_num = True
+                    else:
+                        # If source has no physical unit, target cannot bind to an incompatible physical unit
+                        if t_unit is not None and t_unit not in ("%", "°", "deg"):
+                            continue
+
+                    # Check value match
+                    if s_val is not None and t_val is not None:
+                        # Sign check: strict
+                        if (s_val < 0 and t_val >= 0) or (s_val > 0 and t_val <= 0):
+                            continue
+                        if s_val == 0.0:
+                            if t_val == 0.0:
+                                found_idx = idx
+                                break
+                        else:
+                            # Strict relative tolerance, no zero-crossing false accept (abs_tol=0.0)
+                            if math.isclose(s_val, t_val, rel_tol=1e-5, abs_tol=0.0):
+                                found_idx = idx
+                                break
+                    elif s_tok == t_tok:
+                        found_idx = idx
                         break
 
-                if not matched_num:
+                if found_idx is not None:
+                    remaining_tgt.pop(found_idx)
+                else:
                     numerical_issues.append({
                         "id": item_id,
-                        "expected_entity": raw_num,
-                        "expected_token": expected_token,
-                        "numeric_base": expected_token,
+                        "expected_entity": s_raw,
+                        "expected_token": s_tok,
+                        "numeric_base": s_tok,
+                        "unit": s_unit,
                         "source": src_text,
                         "translation": tgt_text,
-                        "issue": f"Numeric value '{expected_token}' from '{raw_num}' not found in translation"
+                        "issue": f"Numeric entity '{s_raw}' not matched or bound incorrectly in translation"
                     })
-                    continue
-
-                # Check unit preservation if unit is present
-                if expected_unit:
-                    u_key = expected_unit.lower()
-                    unit_matched = False
-                    for u_name, regex_list in UNIT_SPECS:
-                        if u_name == u_key:
-                            for rx in regex_list:
-                                if rx.search(tgt_text):
-                                    unit_matched = True
-                                    break
-                            break
-
-                    if not unit_matched:
-                        numerical_issues.append({
-                            "id": item_id,
-                            "expected_entity": raw_num,
-                            "unit": expected_unit,
-                            "source": src_text,
-                            "translation": tgt_text,
-                            "issue": f"Unit '{expected_unit}' from '{raw_num}' not found or mistranslated"
-                        })
 
             # 2. Citation Preservation Check
             bracket_cits = BRACKET_CITATION_REGEX.findall(src_text)

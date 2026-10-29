@@ -136,6 +136,45 @@ class DocumentExtractor:
         eq_counter = 0
         sections_seen = {current_sec_title}
 
+        # Auto-discover figure manifest if available
+        fig_image_map = {}
+        pdf_dir = os.path.dirname(os.path.abspath(pdf_path))
+        candidate_manifest_dirs = [
+            os.path.join(pdf_dir, "paper_figures"),
+            os.path.join(pdf_dir, "figures"),
+            os.path.join(pdf_dir, "column-figures"),
+            pdf_dir,
+            "paper_figures",
+            "figures",
+            "column-figures",
+            "."
+        ]
+        # Also check directories in pdf_dir or cwd containing 'figure'
+        for search_dir in [pdf_dir, "."]:
+            try:
+                for entry in os.listdir(search_dir):
+                    full_p = os.path.join(search_dir, entry)
+                    if os.path.isdir(full_p) and "figure" in entry.lower() and full_p not in candidate_manifest_dirs:
+                        candidate_manifest_dirs.append(full_p)
+            except Exception:
+                pass
+
+        for c_dir in candidate_manifest_dirs:
+            mf_file = os.path.join(c_dir, "figures_manifest.json")
+            if os.path.isfile(mf_file):
+                try:
+                    with open(mf_file, "r", encoding="utf-8") as f:
+                        f_list = json.load(f)
+                        for f_ent in f_list:
+                            f_id = str(f_ent.get("figure_id", ""))
+                            img_p = f_ent.get("image_path", "")
+                            if f_id and img_p and os.path.isfile(img_p):
+                                fig_image_map[f_id] = img_p
+                except Exception:
+                    pass
+            if fig_image_map:
+                break
+
         for pno, page in enumerate(doc):
             page_num = pno + 1
             # 1. First extract native tables if any
@@ -240,6 +279,8 @@ class DocumentExtractor:
                     items.append({
                         "id": f"fig-{fig_id}-cap",
                         "kind": "figure",
+                        "figure_no": fig_id,
+                        "image_path": fig_image_map.get(fig_id, ""),
                         "section": current_sec_title,
                         "page": page_num,
                         "spans": spans_meta,
