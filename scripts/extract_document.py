@@ -47,12 +47,17 @@ EQUATION_LINE_REGEX = re.compile(
     r'(?:\(\s*([0-9]+[a-z]?)\s*\)|(?:Eq\.|Equation)\s*\(?([0-9]+[a-z]?)\)?)\s*$'
 )
 
-# Common abbreviations to prevent false sentence splits
-ABBREVIATIONS = [
-    "e.g.", "i.e.", "et al.", "Fig.", "Figs.", "Figure.", "Table.", "Tab.",
-    "Eq.", "Eqs.", "Ref.", "Refs.", "vs.", "al.", "no.", "Vol.", "pp.",
-    "approx.", "min.", "sec.", "hr.", "Dr.", "Prof.", "Dept.", "Univ.", "cf.", "ca."
-]
+try:
+    from align_bilingual import split_en_sentences, split_zh_sentences
+except ImportError:
+    try:
+        from scripts.align_bilingual import split_en_sentences, split_zh_sentences
+    except ImportError:
+        # Fallback if neither is found
+        def split_en_sentences(text: str) -> list[str]:
+            return [s.strip() for s in re.split(r'(?<=[.?!])\s+', text) if s.strip()]
+        def split_zh_sentences(text: str) -> list[str]:
+            return [s.strip() for s in re.split(r'(?<=[。！？])\s*', text) if s.strip()]
 
 
 def clean_text(text: str) -> str:
@@ -60,46 +65,6 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     return re.sub(r'\s+', ' ', text).strip()
-
-
-def split_en_sentences(text: str) -> list[str]:
-    """
-    Splits English text into individual sentences while preserving decimals,
-    abbreviations, citations, and equation references.
-    """
-    cleaned = clean_text(text)
-    if not cleaned:
-        return []
-
-    # Protect abbreviations
-    masked = cleaned
-    for orig in ABBREVIATIONS:
-        masked = masked.replace(orig, orig.replace(".", "<DOT>"))
-
-    # Protect decimal numbers (e.g. 0.25 -> 0<DECIMAL>25)
-    masked = re.sub(r'(\d+)\.(\d+)', r'\1<DECIMAL>\2', masked)
-
-    # Protect bracket citations with periods
-    masked = re.sub(r'\[([^\]]*?\.[^\]]*?)\]', lambda m: "[" + m.group(1).replace(".", "<DOT>") + "]", masked)
-
-    # Split on sentence boundaries: period/question/exclamation mark followed by space + Capital or EOS
-    parts = re.split(r'([.?!]+(?=[\s"\'\)\]]+[A-Z0-9]|$))', masked)
-    raw_sentences = []
-    for i in range(0, len(parts) - 1, 2):
-        s = (parts[i] + parts[i + 1]).strip()
-        if s:
-            raw_sentences.append(s)
-    if len(parts) % 2 == 1 and parts[-1].strip():
-        raw_sentences.append(parts[-1].strip())
-
-    restored = []
-    for s in raw_sentences:
-        s = s.replace("<DOT>", ".").replace("<DECIMAL>", ".")
-        s = clean_text(s)
-        if s:
-            restored.append(s)
-
-    return restored
 
 
 def sanitize_id_part(text: str) -> str:
@@ -178,19 +143,22 @@ class DocumentExtractor:
             try:
                 tabs = page.find_tables()
                 for t_idx, tab in enumerate(tabs.tables):
-                    tbl_id = f"{t_idx + 1:03d}"
+                    tbl_id = f"p{page_num}-tbl{t_idx + 1}"
                     table_cells = tab.extract()
                     # Add table cell items
                     for r_idx, row in enumerate(table_cells):
                         for c_idx, cell_text in enumerate(row):
                             val = clean_text(cell_text) if cell_text else ""
                             if val:
-                                cell_id = f"tbl-{tbl_id}-cell-r{r_idx + 1}c{c_idx + 1}"
+                                cell_id = f"{tbl_id}-cell-r{r_idx + 1}c{c_idx + 1}"
                                 items.append({
                                     "id": cell_id,
                                     "kind": "table_cell",
+                                    "table_id": tbl_id,
                                     "section": current_sec_title,
                                     "page": page_num,
+                                    "row": r_idx,
+                                    "col": c_idx,
                                     "spans": [{"bbox": list(tab.bbox)}],
                                     "source": val,
                                     "status": "pending"
@@ -231,8 +199,12 @@ class DocumentExtractor:
                 if not raw_block_text:
                     continue
 
-                # Skip if block is entirely inside an already extracted table
-                is_inside_table = any(block_rect in tbl_rect for tbl_rect in extracted_tables)
+                # Skip if block substantially overlaps with an already extracted table
+                is_inside_table = any(
+                    (block_rect & tbl_rect).get_area() > 0.35 * block_rect.get_area() or
+                    (block_rect & tbl_rect).get_area() > 0.35 * tbl_rect.get_area()
+                    for tbl_rect in extracted_tables
+                )
                 if is_inside_table:
                     continue
 
@@ -547,7 +519,7 @@ class DocumentExtractor:
             # Tables
             if "\\begin{table}" in p or "\\begin{tabular}" in p:
                 cap_m = re.search(r'\\caption\{([^}]+)\}', p)
-                cap_text = cap_m.group(1).strip() if cap_m else p
+                cap_text = cap_m.group(1).strip() if cap_m else "Table"
                 tbl_m = TABLE_CAPTION_REGEX.search(cap_text)
                 tbl_id = sanitize_id_part(tbl_m.group(1).rstrip(".:,;-")) if tbl_m else f"{b_idx + 1:03d}"
                 items.append({
@@ -559,6 +531,35 @@ class DocumentExtractor:
                     "source": cap_text,
                     "status": "pending"
                 })
+
+                # Extract tabular body rows and cells if present
+                tabular_m = re.search(r'\\begin\{tabular\}\{[^}]*\}(.*?)\\end\{tabular\}', p, re.DOTALL)
+                if tabular_m:
+                    tab_content = tabular_m.group(1).strip()
+                    raw_rows = [r.strip() for r in tab_content.split(r'\\') if r.strip()]
+                    cell_r = 0
+                    for r_str in raw_rows:
+                        clean_r = re.sub(r'\\(hline|toprule|midrule|bottomrule)', '', r_str).strip()
+                        if not clean_r:
+                            continue
+                        cells = [c.strip() for c in clean_r.split('&')]
+                        for c_idx, cell_text in enumerate(cells):
+                            clean_cell = re.sub(r'\\text(?:bf|it|rm|sf)\{([^}]+)\}', r'\1', cell_text).strip()
+                            clean_cell = clean_text(clean_cell)
+                            if clean_cell:
+                                items.append({
+                                    "id": f"tbl-{tbl_id}-cell-r{cell_r + 1}c{c_idx + 1}",
+                                    "kind": "table_cell",
+                                    "table_id": f"tbl-{tbl_id}",
+                                    "section": current_sec_title,
+                                    "page": 1,
+                                    "row": cell_r,
+                                    "col": c_idx,
+                                    "spans": [],
+                                    "source": clean_cell,
+                                    "status": "pending"
+                                })
+                        cell_r += 1
                 continue
 
             # Bibitem

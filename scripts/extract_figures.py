@@ -11,6 +11,7 @@ standard figures and appendix figures (e.g., Fig. S1, Supplementary Figure 1).
 import os
 import re
 import argparse
+import json
 import pymupdf
 
 # Regex matching standard and appendix figures:
@@ -120,7 +121,6 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
         for idx, cap in enumerate(captions):
             fig_id = cap["fig_id"]
             cap_rect = cap["rect"]
-            prev_cap_bottom = captions[idx - 1]["rect"].y1 if idx > 0 else 0.0
 
             # Determine column bounds and alignment
             is_full_width = (
@@ -129,6 +129,24 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
             )
             is_left_col = not is_full_width and cap_rect.x1 <= 0.55 * page_w
             is_right_col = not is_full_width and cap_rect.x0 >= 0.45 * page_w
+
+            # Compute preceding caption bottom ONLY within the same column or from preceding full-width figures
+            same_column_prev = []
+            for c in captions:
+                if c["rect"].y1 <= cap_rect.y0:
+                    c_rect = c["rect"]
+                    c_full = (c_rect.width > 0.55 * page_w or (c_rect.x0 < 0.35 * page_w and c_rect.x1 > 0.65 * page_w))
+                    c_left = not c_full and c_rect.x1 <= 0.55 * page_w
+                    c_right = not c_full and c_rect.x0 >= 0.45 * page_w
+
+                    if is_full_width or c_full:
+                        same_column_prev.append(c_rect.y1)
+                    elif is_left_col and c_left:
+                        same_column_prev.append(c_rect.y1)
+                    elif is_right_col and c_right:
+                        same_column_prev.append(c_rect.y1)
+
+            prev_cap_bottom = max(same_column_prev, default=0.0)
 
             # Define candidate column horizontal boundaries
             if is_full_width:
@@ -245,6 +263,14 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
                 "height": pix.height,
                 "dpi": dpi
             })
+
+    # Save figures manifest JSON for downstream alignment and compilation
+    manifest_path = os.path.join(output_dir, "figures_manifest.json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(extracted_figures, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Warning: could not write figures manifest: {e}")
 
     print(f"Extracted {len(extracted_figures)} figures to {output_dir}")
     return extracted_figures

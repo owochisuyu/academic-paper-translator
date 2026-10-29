@@ -648,7 +648,7 @@ class TestCommandLineInterface(unittest.TestCase):
             "--source", source_jsonl, "--translated", trans_pass, "--report", report_json
         ]
         res_pass = subprocess.run(cmd_pass, capture_output=True, text=True)
-        self.assertEqual(res_pass.returncode, 0, f"validate_translation should exit 0 on pass: {res_pass.stderr}")
+        self.assertEqual(res_pass.returncode, 0, f"validate_translation should exit 0 on pass: {res_pass.stderr}\nSTDOUT: {res_pass.stdout}")
 
         # 3. Build failing translation (omit an ID)
         fail_items = pass_items[:-1]

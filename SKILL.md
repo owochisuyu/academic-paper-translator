@@ -112,23 +112,27 @@ Every translation unit is tied to its canonical `id`. The model or subagent must
 Before compiling any deliverable, execute the two-tier verification script:
 
 ```bash
-python scripts/validate_translation.py --source "source.jsonl" --translated "translated.jsonl" --pdf "<path_to_paper.pdf>" --out "coverage_report.json"
+python scripts/validate_translation.py --source "source.jsonl" --translated "translated.jsonl" --doc "<path_to_paper.pdf>" --report "coverage_report.json"
+# Or using documented aliases:
+# python scripts/validate_translation.py --source "source.jsonl" --translated "translated.jsonl" --pdf "<path_to_paper.pdf>" --out "coverage_report.json"
 ```
 
 The validator checks:
-1. **100% ID Bijection**: Missing IDs, duplicate IDs, or extra unmapped IDs cause an immediate audit failure (`FAIL_AUDIT`).
-2. **Zero Empty Translations**: No empty or whitespace-only translation strings.
-3. **Number & Unit Invariance**: Extracts all numbers, percentages, and physical units from source and asserts their exact presence in the translation.
-4. **Citation Invariance**: Asserts all bracketed and author-year citations are preserved.
-5. **Formula Numbering Invariance**: Asserts equation references (e.g. `(1)`, `Eq. (2)`) are preserved.
+1. **Tier 1 Source Coverage**: Page accounting, non-empty text layer check (detecting scanned PDFs requiring OCR), and block coverage >= 90%.
+2. **100% ID Bijection**: Missing IDs, duplicate source IDs, duplicate translation IDs, or extra unmapped IDs cause an immediate audit failure (`FAIL`).
+3. **Zero Empty Translations**: No empty or whitespace-only translation strings.
+4. **Number & Unit Invariance**: Extracts all exact numbers, signs, scientific notation, and physical units from source and asserts exact token presence in the translation (preventing substring false passes like 0.25 m matching 10.25 m or mm).
+5. **Citation Invariance**: Asserts all bracketed `[1]` and author-year citations are preserved.
+6. **Formula Invariance**: Asserts equations like `$x+y=z$` and equation references (e.g. `(1)`, `Eq. (2)`) are preserved.
+7. **Semantic Polarity Check**: Flags negation discrepancies when source contains negative assertions ('not/cannot') but translation is purely positive.
 
-If any invariant fails, fix the offending ID before proceeding to typesetting.
+If any check fails (status `FAIL`), fix the offending item before proceeding to typesetting.
 
 ---
 
 ### Stage 4: Unified Post-Acceptance Typesetting (Typst)
 
-Once `coverage_report.json` reports `PASSED`, compile the final document:
+Once `coverage_report.json` reports `PASS`, compile the final document:
 
 ```bash
 # Mode A: Sentence-by-sentence Bilingual Interlinear (Recommended)
@@ -136,6 +140,12 @@ python scripts/compile_typst.py "translated.jsonl" --mode A --out-pdf "paper_bil
 
 # Mode B: Full Academic Chinese Publication
 python scripts/compile_typst.py "translated.jsonl" --mode B --out-pdf "paper_chinese.pdf" --previews
+
+# Mode C: Paragraph-level Bilingual
+python scripts/compile_typst.py "translated.jsonl" --mode C --out-pdf "paper_par_bilingual.pdf"
+
+# Mode D: Dual-column Parallel
+python scripts/compile_typst.py "translated.jsonl" --mode D --out-pdf "paper_dual_column.pdf"
 ```
 
 Deploy the generated `.pdf`, `.typ`, and `paper_figures/` directly to target destinations (e.g. Zotero storage).

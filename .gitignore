@@ -4,5 +4,7 @@ __pycache__/
 typst_output/
 extracted_figures/
 .pytest_cache/
+coverage_report.json
+report*.json
 *.png
 *.pdf
