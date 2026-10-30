@@ -259,7 +259,8 @@ def validate_job(job_dir, report_path=None):
         source_path = root / primary if primary else None
         regions = reviewed_regions(job)
         extraction = validate_source_coverage(source, source_path, regions, job.get('scope'),
-                                              source_root=root / 'input', input_files=document.get('input_files'))
+                                              source_root=root / 'input', input_files=document.get('input_files'),
+                                              project_dependencies=document.get('project_dependencies'))
         if not primary:
             extraction['status'] = 'FAIL'
             extraction['details'].append('Canonical document has no primary source input')

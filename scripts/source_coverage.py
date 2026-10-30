@@ -231,7 +231,8 @@ def scan_candidates(page, page_num: int, source_items: list[dict], regions: list
     return candidates
 
 
-def _validate_text_regions(source_items, path, regions, source_root=None, input_files=None, scope=None):
+def _validate_text_regions(source_items, path, regions, source_root=None, input_files=None, scope=None,
+                           project_dependencies=None):
     report = {'status': 'PASS', 'source_items_count': len(source_items), 'details': [],
               'coverage_basis': 'independent character intervals in decoded source files',
               'source_characters': 0, 'covered_characters': 0,
@@ -243,10 +244,31 @@ def _validate_text_regions(source_items, path, regions, source_root=None, input_
     source_root = Path(source_root).resolve() if source_root else path.parent.resolve()
     files = {}
     expected = input_files or [{'path': path.name}]
+    expected_paths = {str(item['path'] if isinstance(item, dict) else item).replace('\\', '/').removeprefix('input/')
+                      for item in expected}
+    dependencies = {}
+    dependency_extensions = {'style': '.sty', 'class': '.cls', 'bibliography_database': '.bib'}
+    for declaration in project_dependencies or []:
+        if not isinstance(declaration, dict):
+            raise ValueError('Project dependency declarations must be objects')
+        relative = str(declaration.get('file', '')).replace('\\', '/').removeprefix('input/')
+        role = declaration.get('role')
+        if (relative not in expected_paths or relative in dependencies
+                or role not in dependency_extensions
+                or Path(relative).suffix.lower() != dependency_extensions[role]
+                or not isinstance(declaration.get('reason'), str) or not declaration['reason'].strip()):
+            raise ValueError(f'Invalid project dependency declaration: {relative}')
+        dependencies[relative] = declaration
+    report['project_dependencies'] = list(dependencies.values())
+    report['unverified_dependency_expansion'] = [name for name, entry in dependencies.items()
+                                                if entry['role'] in ('style', 'class')]
+    if report['unverified_dependency_expansion']:
+        report['status'] = 'NEEDS_REVIEW'
+        report['details'].append('Copied style/class files may expand visible content; source compilation and review remain necessary.')
     for item in expected:
         relative = item['path'] if isinstance(item, dict) else str(item)
-        relative = relative.removeprefix('input/')
-        if Path(relative).suffix.lower() not in ('.md', '.markdown', '.tex', '.latex', '.bib', '.bbl'):
+        relative = relative.replace('\\', '/').removeprefix('input/')
+        if Path(relative).suffix.lower() not in ('.md', '.markdown', '.tex', '.latex', '.bib', '.bbl') and relative not in dependencies:
             continue
         file_path = (source_root / relative).resolve()
         if not file_path.is_relative_to(source_root):
@@ -343,7 +365,15 @@ def _validate_text_regions(source_items, path, regions, source_root=None, input_
                     report['details'].append(f'Region payload is not represented by its source units: {region.get("region_id")}')
                     continue
             elif disposition == 'preserve' and not references:
-                if region.get('role') != 'source_syntax' or _syntax_has_unverified_prose(data['text'][start:end], Path(relative).suffix.lower()):
+                if region.get('role') == 'project_dependency':
+                    evidence = region.get('evidence', {})
+                    if (relative not in dependencies or not isinstance(evidence, dict)
+                            or evidence.get('method') != 'project-dependency'
+                            or not isinstance(evidence.get('reason'), str) or not evidence['reason'].strip()):
+                        report['status'] = 'FAIL'
+                        report['details'].append(f'Unverified project dependency region: {region.get("region_id")}')
+                        continue
+                elif region.get('role') != 'source_syntax' or _syntax_has_unverified_prose(data['text'][start:end], Path(relative).suffix.lower()):
                     if report['status'] != 'FAIL':
                         report['status'] = 'NEEDS_REVIEW'
                     report['details'].append(f'Unowned source syntax may contain untranslated prose: {region.get("region_id")}')
@@ -367,7 +397,8 @@ def _validate_text_regions(source_items, path, regions, source_root=None, input_
     return report
 
 
-def validate_source_coverage(source_items: list[dict], doc_path=None, regions=None, scope=None, source_root=None, input_files=None) -> dict:
+def validate_source_coverage(source_items: list[dict], doc_path=None, regions=None, scope=None, source_root=None, input_files=None,
+                             project_dependencies=None) -> dict:
     pages = sorted({p for item in source_items for p in _pages(item)})
     report = {'status': 'PASS', 'source_items_count': len(source_items), 'manifest_pages': pages,
               'missing_pages': [], 'char_coverage_ratio': 1.0, 'unextracted_blocks': [],
@@ -387,7 +418,7 @@ def validate_source_coverage(source_items: list[dict], doc_path=None, regions=No
         report['details'].append(f'Document file does not exist: {path}')
         return report
     if path.suffix.lower() != '.pdf':
-        return _validate_text_regions(source_items, path, regions, source_root, input_files, scope)
+        return _validate_text_regions(source_items, path, regions, source_root, input_files, scope, project_dependencies)
     total, covered = 0, 0
     try:
         with pymupdf.open(path) as doc:

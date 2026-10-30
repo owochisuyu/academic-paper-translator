@@ -10,7 +10,13 @@ def order_pdf_units(items, assets):
     for page in sorted({item['page'] for item in items}):
         groups = {}
         for item in (i for i in items if i['page'] == page):
-            key = item.get('table_id') or item.get('figure_asset_id') or item.get('asset_id') or item.get('parent_id') or item['id']
+            if item.get('provenance') == 'manual' and item.get('source_region_id'):
+                # The independently assessed reading order applies inside this
+                # exact source image only. Native content and other regions still
+                # use page geometry, avoiding cross-page/global manual reordering.
+                key = ('manual-source-region', item['source_region_id'])
+            else:
+                key = item.get('table_id') or item.get('figure_asset_id') or item.get('asset_id') or item.get('parent_id') or item['id']
             groups.setdefault(key, []).append(item)
         positioned = []
         for key, members in groups.items():
@@ -21,7 +27,12 @@ def order_pdf_units(items, assets):
             rect = pymupdf.Rect(boxes[0]) if boxes else pymupdf.Rect(0, 0, 0, 0)
             for box in boxes[1:]:
                 rect |= box
-            if any(i.get('table_id') for i in members):
+            if isinstance(key, tuple) and key[0] == 'manual-source-region':
+                positions = [i.get('source_region_order') for i in members]
+                if any(type(n) is not int for n in positions) or sorted(positions) != list(range(len(members))):
+                    raise ValueError('Incomplete or duplicated source-image reading order')
+                members.sort(key=lambda i: i['source_region_order'])
+            elif any(i.get('table_id') for i in members):
                 members.sort(key=lambda i: (-1, -1) if i['kind'] in ('table', 'table_caption') else (i.get('row', 0), i.get('col', 0)))
             elif asset:
                 members.sort(key=lambda i: (0 if i['kind'] in ('figure', 'equation') else 1,

@@ -22,8 +22,10 @@ The scripts organize and check the work; they do not perform semantic translatio
 - **LaTeX**: bounded structural extraction, protected tokens, and source-project
   export. Unknown constructs remain visible as review items. Full source PDF
   compilation requires an installed compatible TeX engine and Chinese fonts.
-- **Scans/complex PDFs**: import a complete, source-bound MinerU result or transcribe
-  the uncertain region with a source overlay. Live MinerU execution is not bundled.
+- **Scans/complex PDFs**: prepare image-reading packets for the current vision agent,
+  independently check the transcription, then import a source overlay into a new job.
+  See [ocr_protocol.md](references/ocr_protocol.md). A complete, source-bound saved
+  MinerU result is another route; live MinerU execution is not bundled.
 
 Read [data_contract.md](references/data_contract.md) for job/record schemas,
 [translation_protocol.md](references/translation_protocol.md) for model work,
@@ -49,9 +51,12 @@ versions used in verification are recorded there, not assumed installed everywhe
    ticks may be preserved explicitly. Repeated headers/footers may be excluded with
    provenance; body exclusions require a partial scope, not a reviewer waiver.
 
-   If extraction has gaps, fix or supplement it and create a new job. For image
-   text use `--source-overlay` as documented in backends; saving an image does not
-   translate its labels. Do not edit `source.jsonl` to erase a warning.
+   If extraction has gaps, fix or supplement it and create a new job. For scanned
+   regions run `prepare_ocr.py --job-dir runs/paper` and follow the OCR protocol.
+   A vision-capable agent reads the actual high-resolution images; another reviewer
+   compares its transcription with those images before `--source-overlay` import.
+   Saving an image does not translate its labels. Do not edit `source.jsonl` to erase
+   a warning.
 
 2. **Set terminology and prepare context packets.** Write approved terms into
    `glossary.json` where useful, then prepare work for the current agent.

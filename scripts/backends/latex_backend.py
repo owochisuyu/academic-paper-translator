@@ -24,6 +24,25 @@ TEXT_COMMANDS = {'section', 'subsection', 'subsubsection', 'chapter', 'paragraph
 INLINE_PROTECTED = {'cite', 'citep', 'citet', 'ref', 'eqref', 'pageref', 'label', 'url', 'includegraphics', 'ensuremath'}
 FORMATS = {'textbf', 'textit', 'emph', 'textrm', 'textsf', 'texttt', 'underline'}
 LAYOUT = {'centering', 'hline', 'toprule', 'midrule', 'bottomrule', 'small', 'footnotesize', 'noindent', 'maketitle', 'clearpage', 'newpage'}
+CITATIONS = {'cite', 'citep', 'citet', 'citealt', 'citealp', 'citeauthor', 'citeyear',
+             'citeyearpar', 'autocite', 'parencite', 'textcite', 'nocite'}
+
+
+def uncomment_tex(text):
+    """Mask TeX line comments without changing source offsets."""
+    result = list(text)
+    index = 0
+    while index < len(text):
+        if text[index] == '\\':
+            index += 2
+        elif text[index] == '%':
+            end = text.find('\n', index)
+            end = len(text) if end < 0 else end
+            result[index:end] = [' '] * (end - index)
+            index = end
+        else:
+            index += 1
+    return ''.join(result)
 
 
 def group_end(text, start, opener='{', closer='}'):
@@ -46,6 +65,58 @@ def group_end(text, start, opener='{', closer='}'):
                 return index + 1
         index += 1
     raise ValueError(f'Unbalanced {opener}{closer} starting at {start}')
+
+
+def bibtex_group_end(text, start, *, entry=False, limit=None):
+    """Find a BibTeX braced value/entry without applying TeX comment rules.
+
+    Percent-encoded URLs are ordinary database field data. Quotes delimit field
+    values only at entry depth; quotes within a braced field are literal data.
+    Keep this separate from ``group_end``, whose percent handling is needed for
+    actual TeX source. This is a bounded scanner, not BibTeX macro evaluation.
+    """
+    limit = len(text) if limit is None else min(limit, len(text))
+    if not 0 <= start < limit or text[start] != '{':
+        raise ValueError(f'Expected bibliography opening brace at {start}')
+    depth, index, quoted = 1, start + 1, False
+    while index < limit:
+        char = text[index]
+        if char == '\\':
+            index += 2
+            continue
+        if entry and depth == 1 and char == '"':
+            quoted = not quoted
+        elif char == '{':
+            depth += 1
+        elif char == '}':
+            if depth == 1 and quoted:
+                raise ValueError(f'Unclosed bibliography quoted field in entry at {start}')
+            depth -= 1
+            if not depth:
+                return index + 1
+        index += 1
+    message = 'Unclosed bibliography quoted field' if quoted else 'Unbalanced bibliography braces'
+    raise ValueError(f'{message} starting at {start}')
+
+
+def bibtex_quoted_end(text, start, limit):
+    """Find a quoted field, respecting braced protection and escaped quotes."""
+    depth, index = 0, start + 1
+    while index < min(limit, len(text)):
+        char = text[index]
+        if char == '\\':
+            index += 2
+            continue
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            if not depth:
+                raise ValueError(f'Unbalanced bibliography quoted field at {start}')
+            depth -= 1
+        elif char == '"' and not depth:
+            return index + 1
+        index += 1
+    raise ValueError(f'Unclosed bibliography quoted field at {start}')
 
 
 def command_at(text, index):
@@ -84,7 +155,7 @@ def _environment_end(text, start, name, body_start):
 
 
 class LatexParser:
-    def __init__(self, root):
+    def __init__(self, root, main_file=None):
         self.root = Path(root)
         self.items, self.regions, self.assets, self.warnings = [], [], [], []
         self.files, self.active = set(), set()
@@ -92,6 +163,99 @@ class LatexParser:
         self.sequence, self.section_count, self.reference_count, self.table_count, self.figure_count = 0, 0, 0, 0, 0
         self.current_table = None
         self.current_figure = None
+        self.main_file = Path(main_file) if main_file else None
+        self.bibliography_files = set()
+        self.bibliography_anchors = []
+        self.project_dependencies = {}
+        self.citation_keys = set()
+        self.citation_all = False
+        self.citation_uncertain = False
+        self.bibliography_selection = None
+
+    def collect_citations(self, path, text):
+        masked = uncomment_tex(text)
+        # TeX does not execute citation-looking text in these literal regions.
+        literal = re.compile(r'\\begin\s*\{(verbatim|lstlisting|minted)\}.*?'
+                             r'\\end\s*\{\1\}', re.S)
+        for match in list(literal.finditer(masked)):
+            masked = masked[:match.start()] + ' ' * (match.end() - match.start()) + masked[match.end():]
+        for match in list(re.finditer(r'\\verb\*?([^A-Za-z\s])', masked)):
+            stop = masked.find(match.group(1), match.end())
+            newline = masked.find('\n', match.end())
+            if stop >= 0 and (newline < 0 or stop < newline):
+                masked = masked[:match.start()] + ' ' * (stop + 1 - match.start()) + masked[stop + 1:]
+        for match in re.finditer(r'\\([A-Za-z]+\*?)', masked):
+            prior = match.start() - 1
+            while prior >= 0 and text[prior] == '\\':
+                prior -= 1
+            if (match.start() - prior - 1) % 2:
+                continue
+            name = match.group(1).rstrip('*')
+            if name not in CITATIONS:
+                if 'cite' in name.casefold():
+                    self.citation_uncertain = True
+                    self.warn('citation_scope_requires_review', path, match.start(), command=name)
+                continue
+            _, _, args = command_at(text, match.start())
+            req = _required(args)
+            value = text[req[0][1]:req[0][2]] if req else ''
+            keys = [part.strip() for part in value.split(',')]
+            if name == 'nocite' and keys == ['*']:
+                self.citation_all = True
+            elif not keys or any(not re.fullmatch(r'[^\s,{}\\#%*]+', key) for key in keys):
+                self.citation_uncertain = True
+                self.warn('citation_scope_requires_review', path, match.start(), command=name)
+            else:
+                self.citation_keys.update(keys)
+
+    def resolve_bibliography(self):
+        if not self.bibliography_files and not self.bibliography_anchors:
+            return
+        bbl = self.main_file.with_suffix('.bbl') if self.main_file else None
+        start = len(self.items)
+        if bbl and bbl.is_file():
+            self.parse_file(bbl)
+            keys = {item['bibliography_key'] for item in self.items[start:]
+                    if item.get('kind') == 'reference' and item.get('bibliography_key')}
+            missing = self.citation_keys - keys
+            extra = keys - self.citation_keys if not self.citation_all else set()
+            if not keys:
+                self.warn('compiled_bibliography_requires_review', bbl, 0,
+                          reason='No supported bibitem records in compiled bibliography')
+            if missing:
+                self.warn('missing_cited_bibliography_entries', bbl, 0, keys=sorted(missing))
+            if extra and not self.citation_uncertain:
+                self.warn('compiled_bibliography_extra_entries', bbl, 0, keys=sorted(extra))
+            self.bibliography_selection = {'method': 'compiled_bbl',
+                'bbl_file': bbl.relative_to(self.root).as_posix(), 'selected_keys': sorted(keys)}
+        else:
+            found = set()
+            selected = None if self.citation_all else self.citation_keys
+            for path in sorted(self.bibliography_files):
+                present = self.parse_bibliography(path, selected_keys=selected)
+                if found & present:
+                    self.warn('duplicate_bibliography_key', path, 0, keys=sorted(found & present))
+                found.update(present)
+            missing = self.citation_keys - found
+            if missing:
+                self.warn('missing_cited_bibliography_entries', self.main_file, 0, keys=sorted(missing))
+            self.bibliography_selection = {'method': 'static_citations',
+                'selected_keys': sorted(found if self.citation_all else found & self.citation_keys),
+                'selected_fields': ['title'], 'rendering_verified': False}
+            if self.bibliography_selection['selected_keys']:
+                self.warn('compiled_bibliography_unavailable', self.main_file, 0,
+                          keys=self.bibliography_selection['selected_keys'],
+                          reason='Only database titles were extracted; complete printed bibliography '
+                                 'text and formatting require a compiled bibliography or source review.')
+        self.bibliography_selection.update(citation_keys=sorted(self.citation_keys),
+            nocite_all=self.citation_all, uncertain=self.citation_uncertain)
+        if self.bibliography_anchors:
+            if len(self.bibliography_anchors) > 1:
+                self.warn('multiple_bibliography_placements_require_review', self.main_file, 0)
+            additions = self.items[start:]
+            del self.items[start:]
+            anchor = self.bibliography_anchors[0]
+            self.items[anchor:anchor] = additions
 
     def warn(self, code, path, start, **extra):
         self.warnings.append({'code': code, 'file': Path(path).relative_to(self.root).as_posix(), 'offset': start, **extra})
@@ -229,6 +393,8 @@ class LatexParser:
         self.active.add(path)
         self.files.add(path)
         text = path.read_text(encoding='utf-8-sig')
+        if path.suffix.lower() != '.bbl':
+            self.collect_citations(path, text)
         begin = re.search(r'\\begin\s*\{document\}', text)
         if begin:
             # Preamble is preserved; title and author display metadata remain explicit.
@@ -242,7 +408,7 @@ class LatexParser:
         else:
             self.parse_range(path, text, 0, len(text))
         # Copy local class/style/bibliography dependencies; unknown generated resources remain explicit.
-        for match in re.finditer(r'\\(bibliography|addbibresource|documentclass|usepackage)\b', text):
+        for match in re.finditer(r'\\(bibliography|addbibresource|documentclass|usepackage)\b', uncomment_tex(text)):
             name, end, args = command_at(text, match.start())
             req = _required(args)
             if not req:
@@ -252,17 +418,24 @@ class LatexParser:
                 suffix = '.bib' if name in ('bibliography', 'addbibresource') else '.cls' if name == 'documentclass' else '.sty'
                 dependency = path.parent / (value if Path(value).suffix else value + suffix)
                 if dependency.is_file():
-                    self.files.add(dependency.resolve())
+                    dependency = dependency.resolve()
+                    if not dependency.is_relative_to(self.root):
+                        raise ValueError('LaTeX dependency leaves project root')
+                    self.files.add(dependency)
+                    role = {'.bib': 'bibliography_database', '.sty': 'style', '.cls': 'class'}[suffix]
+                    self.project_dependencies[dependency] = {'file': dependency.relative_to(self.root).as_posix(),
+                        'role': role, 'reason': 'Project dependency preserved; displayed prose is extracted from active source and the selected bibliography.'}
                     if suffix == '.bib':
-                        self.parse_bibliography(dependency.resolve())
+                        self.bibliography_files.add(dependency)
                 elif suffix == '.bib':
                     self.warn('missing_bibliography', path, match.start(), dependency=value)
         self.active.remove(path)
 
-    def parse_bibliography(self, path):
+    def parse_bibliography(self, path, selected_keys=None):
         text = path.read_text(encoding='utf-8-sig')
         if any(r.get('locator', {}).get('file') == path.relative_to(self.root).as_posix() for r in self.regions):
-            return
+            return set()
+        found = set()
         cursor = 0
         while cursor < len(text):
             match = re.search(r'@(\w+)\s*\{', text[cursor:])
@@ -270,41 +443,51 @@ class LatexParser:
                 break
             start = cursor + match.start()
             opening = cursor + match.end() - 1
-            end = group_end(text, opening)
+            end = bibtex_group_end(text, opening, entry=True)
             comma = text.find(',', opening + 1, end)
             if comma < 0 or match.group(1).casefold() in ('string', 'preamble'):
                 self.warn('bibliography_expression_requires_review', path, start)
                 cursor = end
                 continue
             key = text[opening + 1:comma].strip()
+            if key in found:
+                self.warn('duplicate_bibliography_key', path, start, key=key)
+            found.add(key)
+            if selected_keys is not None and key not in selected_keys:
+                cursor = end
+                continue
             field_cursor = comma + 1
             while field_cursor < end - 1:
-                field = re.match(r'\s*,?\s*(\w+)\s*=\s*', text[field_cursor:end - 1])
+                field = re.match(r'\s*,?\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*', text[field_cursor:end - 1])
                 if not field:
                     if text[field_cursor:end - 1].strip(' \r\n\t,'):
                         self.warn('bibliography_expression_requires_review', path, field_cursor)
                     break
                 value_start = field_cursor + field.end()
+                literal = True
+                if value_start >= end - 1:
+                    raise ValueError(f'Empty bibliography field at {value_start}')
                 if text[value_start] == '{':
-                    value_end = group_end(text, value_start)
+                    value_end = bibtex_group_end(text, value_start, limit=end - 1)
                     inner_start, inner_end = value_start + 1, value_end - 1
                 elif text[value_start] == '"':
-                    value_end = value_start + 1
-                    while value_end < end and (text[value_end] != '"' or text[value_end - 1] == '\\'):
-                        value_end += 1
-                    if value_end >= end:
-                        raise ValueError('Unclosed bibliography quoted field')
-                    inner_start, inner_end = value_start + 1, value_end
-                    value_end += 1
+                    value_end = bibtex_quoted_end(text, value_start, end - 1)
+                    inner_start, inner_end = value_start + 1, value_end - 1
                 else:
+                    literal = False
                     value_end = text.find(',', value_start, end - 1)
                     value_end = end - 1 if value_end < 0 else value_end
                     inner_start, inner_end = value_start, value_end
                 if field.group(1).casefold() == 'title':
-                    self.emit(path, text, inner_start, inner_end, 'reference', split=False,
-                              extra={'bibliography_key': key, 'bibliography_field': 'title'})
+                    tail = text[value_end:end - 1].lstrip()
+                    if not literal or tail.startswith('#'):
+                        self.warn('bibliography_expression_requires_review', path, value_start, key=key)
+                    else:
+                        self.emit(path, text, inner_start, inner_end, 'reference', split=False,
+                                  extra={'bibliography_key': key, 'bibliography_field': 'title'})
                 field_cursor = value_end
             cursor = end
+        return found
 
     def parse_range(self, path, text, start, end, reference=False):
         index, plain_start = start, start
@@ -432,6 +615,8 @@ class LatexParser:
                 index = plain_start = finish
             elif simple in LAYOUT or simple in ('includegraphics', 'item', 'label', 'bibliography', 'addbibresource', 'bibliographystyle'):
                 flush(index)
+                if simple == 'bibliography':
+                    self.bibliography_anchors.append(len(self.items))
                 # These commands remain intact in the copied source project.
                 index = plain_start = stop
             else:
@@ -512,15 +697,24 @@ def discover_main(path, main_file=None):
 
 def extract_project(path, main_file=None):
     root, main = discover_main(path, main_file)
-    parser = LatexParser(root)
+    parser = LatexParser(root, main)
     parser.parse_file(main)
+    parser.resolve_bibliography()
     for source_path in sorted(parser.files):
-        if source_path.suffix.lower() in ('.tex', '.latex', '.bib', '.sty', '.cls'):
+        if source_path.suffix.lower() in ('.tex', '.latex', '.bib', '.bbl', '.sty', '.cls'):
             source_text = source_path.read_text(encoding='utf-8-sig')
+            before = len(parser.regions)
             register_syntax_gaps(parser.regions, source_path, source_text, source_path.relative_to(root).as_posix())
+            dependency = parser.project_dependencies.get(source_path)
+            if dependency:
+                for region in parser.regions[before:]:
+                    region['role'] = 'project_dependency'
+                    region['evidence'] = {'method': 'project-dependency', **dependency}
     return {'items': parser.items, 'regions': parser.regions, 'assets': parser.assets, 'warnings': parser.warnings,
             'document': {'source_format': 'latex', 'source_root': str(root), 'main_file': main.relative_to(root).as_posix(),
                          'input_files': [str(p) for p in sorted(parser.files)], 'extractor': {'name': 'bounded-latex', 'version': '1'},
+                         'project_dependencies': list(parser.project_dependencies.values()),
+                         'bibliography_selection': parser.bibliography_selection,
                          'limitations': ['Macro expansion is not interpreted', 'Unknown macros/environments and expression-based bibliography fields require review']}}
 
 

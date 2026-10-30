@@ -75,6 +75,18 @@ part of the independent terminology assessment.
 
 ## Source-region assessments
 
+For scanned pages, [ocr_protocol.md](ocr_protocol.md) defines image-bound current
+agent transcription and separate source-image assessment. Its collection step
+creates a source overlay, then the normal extractor freezes a new canonical job.
+
+LaTeX documents may declare `project_dependencies` with `file`, `role` and `reason`.
+Only known input `.bib`, `.sty` and `.cls` files can respectively be bibliography
+databases, styles or classes. Exact dependency intervals remain in the ledger;
+this cannot waive `.tex`/`.bbl` prose or a truncated visible source unit. Copied
+styles/classes retain NEEDS_REVIEW because their expansion may introduce visible
+content. Bibliography selection records whether visible references came from the
+main `.bbl` or from statically identifiable citations; uncertainty stays explicit.
+
 `prepare_translation.py --job-dir ... --source-review` creates a request template
 with NOT_RUN statuses, never approvals. Supply actual assessments in
 `source_reviews.jsonl`, bound by region_id, doc_id and

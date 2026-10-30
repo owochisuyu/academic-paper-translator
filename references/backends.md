@@ -44,8 +44,16 @@ Figures are discovered from the specified input, written with document/asset has
 and explicitly connected. Existing figure files can be supplied using
 `--assets-manifest`; the program never scans another document's directories.
 
-For readable text inside an image, the agent can transcribe a source supplement
-before freezing a NEW extraction:
+For scans, use [the image-reading protocol](ocr_protocol.md): `prepare_ocr.py`
+creates high-resolution page/region tasks for the current vision-capable agent.
+Actual transcription and independent image review are required before collection.
+The reviewed overlay retains the complete response, request and source-job binding;
+import verifies them again. Keep that source job and its OCR evidence available.
+This route does not install an OCR engine or call a separate translation provider.
+
+For a small image-label supplement, the existing manual contract remains available
+before freezing a NEW extraction. It records the reviewer's attestation but does
+not claim the separate response/review binding of the scanned-page workflow:
 
 ```text
 python scripts/extract_document.py paper.pdf --job-dir runs/paper-v2 --source-overlay labels.json
@@ -131,6 +139,20 @@ interpretation. The project must support Chinese text/fonts; choosing an engine 
 not equivalent to making every journal template CJK-compatible. Compilation uses
 bounded runs with shell escape disabled and records undefined references. Missing
 engines are NOT_RUN, never a successful PDF result.
+
+BibTeX values use their own lexical rules: percent-encoded URLs are not TeX comments.
+The main file's `.bbl` supplies the visible bibliography when available. Without it,
+static citation keys select candidate titles from `.bib`; this fallback does not
+reconstruct the printed bibliography and remains a review item. The full database
+is retained as a hashed project dependency, not translated as extra paper content.
+Style/class dependencies are also copied, but their possible macro-generated text
+keeps source coverage at NEEDS_REVIEW until its actual expansion is verified.
+
+On the tested 17-page micro Lie project, these changes removed the BibTeX crash and
+extracted the 15 actual bibliography entries. Unknown macros, custom environments
+and math still prevent a complete-source claim. The app's built-in compiler was
+also tried on the original project and timed out; that is a failed compile attempt,
+not evidence that the source cannot be compiled with a correctly configured engine.
 
 Typst supports only the explicitly implemented math subset. It refuses unsupported
 commands instead of passing raw LaTeX through. Original PDF formulas may use a bound
