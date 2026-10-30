@@ -10,7 +10,7 @@ import pymupdf
 from PIL import Image, ImageDraw
 
 from scripts.compile_typst import (RenderError, compile_typst, render_typst_document,
-    latex_to_typst, expected_content, compile_job, export_markdown)
+    latex_to_typst, expected_content, compile_job, export_markdown, TYPST_HEADER_TEMPLATE)
 from scripts.verify_output import inspect_pdf, validate_visual_review, verify_job
 from scripts import document_ir as ir
 
@@ -101,6 +101,31 @@ class RenderingV3Tests(unittest.TestCase):
         markdown = export_markdown(items, 'B')
         self.assertIn('# 一级标题\n', markdown)
         self.assertIn('## 二级标题\n', markdown)
+
+    def test_short_table_moves_all_rows_together_at_page_boundary(self):
+        cells = [{'id': f'c{r}{c}', 'kind': 'table_cell', 'table_id': 't', 'row': r, 'col': c,
+                  'source': f'ROW{r}COL{c}', 'action': 'preserve'}
+                 for r in range(4) for c in range(2)]
+        text = render_typst_document(cells, metadata={'output_stage': 'candidate'})
+        text = text.replace(TYPST_HEADER_TEMPLATE, TYPST_HEADER_TEMPLATE + '\n#v(245mm)\n', 1)
+        typ, pdf = self.root / 'table-boundary.typ', self.root / 'table-boundary.pdf'
+        typ.write_text(text, encoding='utf-8')
+        self.assertTrue(compile_typst(typ, pdf))
+        with pymupdf.open(pdf) as doc:
+            pages = {i for i, page in enumerate(doc) if 'ROW' in page.get_text()}
+            self.assertEqual(pages, {1})
+            self.assertTrue(all(cell['source'] in doc[1].get_text() for cell in cells))
+
+    def test_long_table_remains_breakable_with_all_rows_visible(self):
+        cells = [{'id': f'c{r}{c}', 'kind': 'table_cell', 'table_id': 't', 'row': r, 'col': c,
+                  'source': f'ROW{r:03d}COL{c}', 'action': 'preserve'}
+                 for r in range(80) for c in range(2)]
+        pdf = self.render(cells, metadata={'output_stage': 'candidate'}, name='long-table')
+        with pymupdf.open(pdf) as doc:
+            self.assertGreater(len(doc), 1)
+        segments, graphics, _ = expected_content(cells, 'A')
+        inspection = inspect_pdf(pdf, segments, graphics)
+        self.assertEqual(inspection['status'], 'PASS', inspection)
 
     def test_mode_c_groups_parent_paragraph_and_mode_d_aligns_columns(self):
         items = [{'id': 'a', 'kind': 'sentence', 'parent_id': 'p', 'source': 'LEFT_SENTINEL one.', 'translation': '右侧标记第一句。'},

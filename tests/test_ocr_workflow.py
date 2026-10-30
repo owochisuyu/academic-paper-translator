@@ -9,7 +9,7 @@ import pymupdf
 from PIL import Image
 
 from scripts.document_ir import (ContractError, atomic_write_json, atomic_write_jsonl,
-    canonical_hash, create_job, file_hash, read_json, read_jsonl)
+    canonical_hash, create_job, file_hash, load_job, read_json, read_jsonl)
 from scripts.prepare_ocr import BINDINGS, collect_ocr, prepare_ocr
 from scripts.backends.manual_overlay import apply_overlay
 from scripts.backends.pdf_order import order_pdf_units
@@ -60,6 +60,71 @@ class TestOCRWorkflow(unittest.TestCase):
 
     def collect(self):
         return collect_ocr(self.job['root'], self.root/'overlay.json')
+
+    def create_compiled_source_job(self):
+        """Freeze a PDF together with the project and compile provenance."""
+        source = self.root / 'source/main.tex'
+        source.parent.mkdir()
+        source.write_text(r'\documentclass{article}\begin{document}Source.\end{document}', encoding='utf-8')
+        log = self.root / 'compile.log'
+        log.write_text('Synthetic compile fixture; no compiler run.', encoding='utf-8')
+        manifest = self.root / 'compile-manifest.json'
+        atomic_write_json(manifest, {'source_sha256': file_hash(source), 'pdf_sha256': file_hash(self.pdf)})
+        raw_regions = copy.deepcopy(self.regions)
+        pdf_hash = file_hash(self.pdf)
+        # Native regions begin with the PDF identity; create_job replaces it with
+        # the complete input-set identity and scopes referenced source units.
+        for n, region in enumerate(raw_regions, 1):
+            region.update(doc_id=pdf_hash, unit_ids=[f'h{n}'])
+        headers = [{'id': f'h{n}', 'page': n, 'source': 'Header', 'kind': 'sentence'} for n in (1, 2)]
+        self.job = create_job(self.pdf, self.root / 'compiled-job', headers, regions=raw_regions,
+            extra_document={'source_root': str(self.root),
+                            'input_files': [str(p) for p in (self.pdf, source, log, manifest)]})
+        self.manifest = prepare_ocr(self.job['root'], dpi=144)
+        self.responses = []
+        for pointer in self.manifest['regions']:
+            request = read_json(self.job['root'] / pointer['request'])
+            self.responses.append({'region_id': request['region_id'], **{k: request[k] for k in BINDINGS},
+                'status': 'transcribed', 'complete': True,
+                'producer': {'name': 'fixture transcriber', 'method': 'agent'},
+                'units': [{'source': 'Visible fixture text.', 'kind': 'sentence',
+                           'bbox': [20, 40, 180, 70], 'order': 0, 'uncertain': False}],
+                'uncertainties': []})
+        return raw_regions
+
+    def test_reviewed_overlay_supports_pdf_jobs_with_frozen_source_dependencies(self):
+        raw_regions = self.create_compiled_source_job()
+        doc_id, pdf_hash = self.job['document']['doc_id'], file_hash(self.pdf)
+        self.assertNotEqual(doc_id, pdf_hash)
+        self.assertEqual(len(self.job['document']['input_files']), 4)
+        self.assertEqual(self.manifest['doc_id'], doc_id)
+        self.assertEqual(self.manifest['source_sha256'], pdf_hash)
+        self.assertTrue(all(r['region_id'].startswith(doc_id[:16] + ':') for r in self.responses))
+        self.write()
+        self.assertEqual(self.collect()['regions'], 2)
+        items, assets = [], []
+        regions = copy.deepcopy(raw_regions)
+        warnings, info = apply_overlay(self.pdf, self.root / 'overlay.json', items, regions, assets, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(info['resolved_regions'], ['p1:image', 'p2:image'])
+        self.assertEqual([i['source'] for i in items], ['Visible fixture text.'] * 2)
+        self.assertEqual([i['source_region_id'] for i in items], ['p1:image', 'p2:image'])
+        self.assertTrue(all(r['disposition'] == 'preserve' for r in regions[:2]))
+
+    def test_changed_frozen_source_dependency_invalidates_reviewed_pdf_overlay(self):
+        raw_regions = self.create_compiled_source_job()
+        self.write()
+        self.collect()
+        snapshot = self.job['root'] / 'input/source/main.tex'
+        snapshot.write_text('Changed project source after review.', encoding='utf-8')
+        with self.assertRaisesRegex(ContractError, 'Input hash mismatch'):
+            load_job(self.job['root'])
+        items, assets, regions = [], [], copy.deepcopy(raw_regions)
+        with self.assertRaisesRegex(ContractError, 'Input hash mismatch'):
+            apply_overlay(self.pdf, self.root / 'overlay.json', items, regions, assets, [])
+        self.assertEqual(items, [])
+        self.assertEqual(assets, [])
+        self.assertEqual(regions, raw_regions)
 
     def test_preparation_creates_readable_images_without_approvals_or_frozen_edits(self):
         before = {p.name:file_hash(p) for p in self.job['root'].iterdir() if p.is_file()}

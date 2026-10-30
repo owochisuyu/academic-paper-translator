@@ -15,7 +15,7 @@ from scripts.extract_figures import extract_figures
 from scripts.document_ir import load_job, file_hash
 from scripts.backends.latex_backend import extract_project, export_project, restore_translation, compile_project
 from scripts.backends.mineru_backend import extract_mineru
-from scripts.backends.pdf_structure import refine_table, merge_hanging_references, merge_page_continuations, normalize_line_wraps
+from scripts.backends.pdf_structure import refine_table, merge_hanging_references, merge_page_continuations, normalize_line_wraps, repeated_running_matter
 from scripts.backends.pdf_order import order_pdf_units
 
 
@@ -273,6 +273,32 @@ class ExtractionV3(unittest.TestCase):
         joined = merge_page_continuations([previous, following], [])
         self.assertEqual(joined[0]['source'], 'The main limitation is the sensor count.')
         self.assertEqual([part['locators'][0]['page'] for part in joined[0]['source_parts']], [1, 2])
+
+    def test_single_page_footer_number_does_not_become_a_reference(self):
+        path = self.root / 'single-page.pdf'
+        with pymupdf.open() as doc:
+            page = doc.new_page(width=600, height=800)
+            page.insert_text((60, 100), 'References', fontsize=14)
+            page.insert_text((60, 140), '[1] Author. A source title. 2026.', fontsize=10)
+            page.insert_text((297, 760), '1', fontsize=10)
+            doc.save(path)
+        extractor = DocumentExtractor()
+        with patch.object(pymupdf.Page, 'find_tables', return_value=SimpleNamespace(tables=[])):
+            items, stats = extractor.extract(path)
+        self.assertEqual([i['source'] for i in items if i['kind'] == 'reference'],
+                         ['[1] Author. A source title. 2026.'])
+        self.assertEqual(stats['excluded_regions'], 1)
+        footer = next(r for r in extractor.regions if r['raw_text'] == '1')
+        self.assertEqual(footer['evidence']['role'], 'page_number')
+        self.assertEqual(footer['disposition'], 'excluded')
+
+    def test_single_numeric_body_or_edge_content_is_not_a_page_number(self):
+        with pymupdf.open() as doc:
+            page = doc.new_page(width=600, height=800)
+            page.insert_text((297, 400), '1', fontsize=10)
+            page.insert_text((60, 750), '1', fontsize=10)
+            page.insert_text((297, 780), '42', fontsize=10)
+            self.assertEqual(repeated_running_matter(doc), {})
 
     def test_native_wrap_normalization_preserves_evidence_and_lexical_hyphens(self):
         raw = 'Sensor Data Fusion and Multisensor Fu-\nsion. vision-\naided. https://doi.org/10.1109/\nICRA.2016.7487628'

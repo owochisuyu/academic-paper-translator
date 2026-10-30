@@ -48,6 +48,10 @@ TYPST_HEADER_TEMPLATE = r'''#set page(paper: "a4", margin: (x: 20mm, y: 20mm),
 #let zhp(t) = block(breakable: true, width: 100%, inset: (y: 2pt))[#zh(t)]
 #let parallel(a, b) = table(columns: (1fr, 1fr), stroke: none, inset: 5pt,
   table.cell(breakable: true)[#en(a)], table.cell(breakable: true)[#zh(b)])
+#let paper-table(body) = context layout(size => {
+  let short = measure(body, width: size.width).height <= 70mm
+  block(breakable: not short, width: 100%, body)
+})
 '''
 
 
@@ -301,9 +305,9 @@ def _render_table(cells, captions, mode, draft):
         # Missing cells cannot be silently invented in a canonical table.
         if not draft and occupied != {(r, c) for r in range(rows) for c in range(cols)}:
             raise RenderError('Incomplete table grid; register empty cells explicitly')
-        result = [f'#table(columns: {cols}, stroke: none, inset: 5pt,',
+        result = [f'#paper-table(table(columns: {cols}, stroke: none, inset: 5pt,',
                   ' table.hline(y: 0, stroke: 1pt),', *lines,
-                  f' table.hline(y: {rows}, stroke: 1pt),', ')']
+                  f' table.hline(y: {rows}, stroke: 1pt),', '))']
     elif draft:
         result = ['#text(fill: red)[DRAFT: table cells unavailable]']
     else:

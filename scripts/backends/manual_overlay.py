@@ -100,13 +100,16 @@ def _validate_reviewed_overlay(value, overlay_path, source_id, current_regions):
         raise ValueError('Reviewed OCR overlay requires the original frozen source job')
     origin = Path(origin)
     job = load_job(origin if origin.is_absolute() else Path(overlay_path).resolve().parent / origin)
-    if (job['document']['doc_id'] != source_id
-            or digest(resolve_job_path(job['root'], job['document']['primary_input'])) != source_id
+    # A PDF job may also freeze its source project, compile log and manifest.
+    # Its document identity then covers every input, not only the PDF bytes.
+    origin_doc_id = job['document']['doc_id']
+    if (digest(resolve_job_path(job['root'], job['document']['primary_input'])) != source_id
             or value.get('source_job_manifest_hash') != job['document']['source_manifest_hash']):
         raise ValueError('OCR overlay is not bound to the original frozen source job')
     manifest = read_json(job['root'] / 'ocr/manifest.json')
-    for key in ('doc_id', 'source_manifest_hash', 'source_sha256'):
-        expected = job['document']['source_manifest_hash'] if key == 'source_manifest_hash' else source_id
+    for key, expected in (('doc_id', origin_doc_id),
+                          ('source_manifest_hash', job['document']['source_manifest_hash']),
+                          ('source_sha256', source_id)):
         if manifest.get(key) != expected:
             raise ValueError(f'OCR manifest has stale {key}')
     frozen = {r['region_id']: r for r in job['regions']
@@ -118,7 +121,7 @@ def _validate_reviewed_overlay(value, overlay_path, source_id, current_regions):
     if (len(requested) != len(pointers) or len(ids) != len(set(ids))
             or set(ids) != set(frozen) or set(ids) != set(requested)):
         raise ValueError('OCR overlay must retain exactly every reviewed source region')
-    prefix = source_id[:16] + ':'
+    prefix = origin_doc_id[:16] + ':'
     reviewer_names, reviewer_methods = [], []
     for entry in supplied:
         ident = entry['region_id']
@@ -128,7 +131,7 @@ def _validate_reviewed_overlay(value, overlay_path, source_id, current_regions):
         # create_job scopes these fields; compare the entire same-source region.
         current = copy.deepcopy(original)
         current['region_id'] = ident
-        current['doc_id'] = source_id
+        current['doc_id'] = origin_doc_id
         current['unit_ids'] = [v if v.startswith(prefix) else prefix + v for v in current.get('unit_ids', [])]
         if current != frozen[ident]:
             raise ValueError('Reviewed OCR geometry or region differs from current source extraction')
@@ -149,6 +152,7 @@ def _validate_reviewed_overlay(value, overlay_path, source_id, current_regions):
                          'id': '; '.join(dict.fromkeys(reviewer_names))}
     if value['reviewer'] != expected_reviewer:
         raise ValueError('OCR overlay reviewer differs from the independent review')
+    return origin_doc_id
 
 
 def checked_box(value, parent, label='text'):
@@ -223,16 +227,18 @@ def apply_overlay(source_path, overlay_path, items, regions, assets, warnings):
     reviewed_ocr = (value.get('schema_version') == 2 or 'contract' in value or value.get('method') == OCR_METHOD
                     or any(any(k in entry for k in ('response', 'review', 'transcription_hash', 'request', 'source_image'))
                            for entry in supplied))
+    origin_doc_id = source_id
     if reviewed_ocr:
         # Verify every region before appending units, changing dispositions, or writing figure crops.
-        _validate_reviewed_overlay(value, overlay_path, source_id, region_lookup)
+        origin_doc_id = _validate_reviewed_overlay(value, overlay_path, source_id, region_lookup)
+    prefix = origin_doc_id[:16] + ':'
     seen, resolved = set(), set()
     for entry in supplied:
         if not isinstance(entry, dict):
             raise ValueError('Overlay region must be an object')
         region_id = entry.get('region_id', '')
-        if region_id.startswith(source_id[:16] + ':'):
-            region_id = region_id[len(source_id[:16]) + 1:]
+        if region_id.startswith(prefix):
+            region_id = region_id[len(prefix):]
         if region_id in seen or region_id not in region_lookup:
             raise ValueError('Duplicate or unknown overlay region: ' + region_id)
         seen.add(region_id)

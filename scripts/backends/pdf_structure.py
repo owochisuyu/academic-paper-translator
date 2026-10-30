@@ -10,6 +10,7 @@ from .common import normalize_with_map
 
 def repeated_running_matter(document):
     candidates = defaultdict(list)
+    single_page_numbers = {}
     for page_index, page in enumerate(document):
         for block in page.get_text('blocks'):
             if block[6] != 0:
@@ -20,6 +21,12 @@ def repeated_running_matter(document):
             placement = 'footer' if block[1] > .9 * page.rect.height else 'header' if block[3] < .09 * page.rect.height else None
             if placement is None:
                 continue
+            if (placement == 'footer' and text == str(page_index + 1)
+                    and abs((block[0] + block[2]) / 2 - page.rect.width / 2) <= .05 * page.rect.width):
+                key = (page_index + 1, tuple(round(v, 2) for v in block[:4]))
+                single_page_numbers[key] = {
+                    'role': 'page_number', 'reason': 'Standalone centered physical page number outside the body area',
+                    'pages': [page_index + 1], 'signature': '<page-number>'}
             lines = text.splitlines()
             if lines and re.fullmatch(r'\s*\d+\s*', lines[-1]):
                 lines = lines[:-1]
@@ -28,11 +35,12 @@ def repeated_running_matter(document):
                 signature = '<page-number>'
             if signature:
                 candidates[(placement, signature)].append((page_index + 1, tuple(round(v, 2) for v in block[:4])))
-    return {key: {'role': placement, 'reason': 'Repeated running matter outside body area',
+    repeated = {key: {'role': placement, 'reason': 'Repeated running matter outside body area',
                   'pages': sorted({p for p, _ in occurrences}), 'signature': signature}
             for (placement, signature), occurrences in candidates.items()
             if len({p for p, _ in occurrences}) >= 2
             for key in occurrences}
+    return {**single_page_numbers, **repeated}
 
 
 def native_lines(page):

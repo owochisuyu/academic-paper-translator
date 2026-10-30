@@ -181,6 +181,18 @@ def create_job(input_path, job_dir, items, regions=None, assets=None,
             raise ContractError(f'Input dependency outside source root: {path}')
         inputs.append({'path': 'input/' + path.relative_to(source_root).as_posix(),
                        'sha256': file_hash(path)})
+    evidence_copies = []
+    equation_overlay = extra.get('equation_overlay')
+    if equation_overlay:
+        manifest_path = Path(equation_overlay['path']).resolve()
+        manifest_bytes = manifest_path.read_bytes()
+        digest = hashlib.sha256(manifest_bytes).hexdigest()
+        if digest != equation_overlay.get('sha256'):
+            raise ContractError('Equation overlay changed after extraction')
+        relative = 'evidence/equation-overlay-' + digest + '.json'
+        inputs.append({'path': relative, 'sha256': digest})
+        evidence_copies.append((relative, manifest_bytes))
+        equation_overlay['path'] = relative
     doc_id = inputs[0]['sha256'] if len(inputs) == 1 else canonical_hash(inputs)
     prefix = doc_id[:16] + ':'
     root.mkdir(parents=True, exist_ok=True)
@@ -189,6 +201,10 @@ def create_job(input_path, job_dir, items, regions=None, assets=None,
         destination.parent.mkdir(parents=True, exist_ok=True)
         if path != destination:
             shutil.copy2(path, destination)
+    for relative, content in evidence_copies:
+        destination = resolve_job_path(root, relative)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
     main_file = extra.pop('main_file', None)
     if original.is_dir():
         if main_file:

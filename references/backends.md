@@ -122,6 +122,12 @@ or exact original Markdown typography.
 
 ## LaTeX source projects
 
+For expansion-dependent projects, use the [compiled-PDF route](latex_protocol.md).
+`compile_latex_source.py` invokes a real engine on a separate source copy;
+`import_latex_pdf.py` verifies and freezes the source/compile/PDF evidence before
+normal PDF extraction. This avoids treating a limited parser's unknown macro as an
+automatic stop for the entire paper. Source and translation gates still apply.
+
 ```text
 python scripts/extract_document.py source-project --main-file main.tex --job-dir runs/tex-paper
 python -m scripts.backends.latex_backend --job-dir runs/tex-paper --out translated-project

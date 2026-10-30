@@ -70,7 +70,8 @@ def _load_assets(path, doc_id):
 
 class DocumentExtractor:
     def __init__(self, scope='full', assets_manifest=None, asset_dir=None,
-                 backend='native', mineru_result=None, main_file=None, source_overlay=None):
+                 backend='native', mineru_result=None, main_file=None, source_overlay=None,
+                 equation_overlay=None):
         if scope not in ('full', 'body'):
             raise ValueError(f'Invalid scope: {scope}')
         self.scope = scope
@@ -80,6 +81,7 @@ class DocumentExtractor:
         self.mineru_result = mineru_result
         self.main_file = main_file
         self.source_overlay = source_overlay
+        self.equation_overlay = equation_overlay
         self.regions, self.assets, self.warnings = [], [], []
         self.extra_document = {}
 
@@ -133,6 +135,16 @@ class DocumentExtractor:
             total_pages = 1
         else:
             raise ValueError('Supported inputs: PDF, Markdown, .tex, or a LaTeX project directory')
+        if self.equation_overlay:
+            if suffix != '.pdf' or self.backend != 'native':
+                raise ValueError('Equation overlays require native PDF extraction')
+            try:
+                from .backends.pdf_equation_overlay import apply_equation_overlay
+            except ImportError:
+                from backends.pdf_equation_overlay import apply_equation_overlay
+            self.warnings, overlay_info = apply_equation_overlay(
+                path, self.equation_overlay, items, self.regions, self.assets, self.warnings)
+            self.extra_document['equation_overlay'] = overlay_info
         if self.source_overlay:
             if suffix != '.pdf':
                 raise ValueError('Manual source overlays currently support PDF regions only')
@@ -420,11 +432,13 @@ class DocumentExtractor:
 
 
 def extract_document(input_path, output_jsonl='source.jsonl', scope='full', summary_path=None,
-                     job_dir=None, assets_manifest=None, backend='native', mineru_result=None, main_file=None, source_overlay=None):
+                     job_dir=None, assets_manifest=None, backend='native', mineru_result=None, main_file=None, source_overlay=None,
+                     equation_overlay=None):
     extractor = DocumentExtractor(scope, assets_manifest=assets_manifest,
                                   asset_dir=Path(job_dir) / 'extracted-assets' if job_dir else None,
                                   backend='native' if backend == 'auto' else backend,
-                                  mineru_result=mineru_result, main_file=main_file, source_overlay=source_overlay)
+                                  mineru_result=mineru_result, main_file=main_file, source_overlay=source_overlay,
+                                  equation_overlay=equation_overlay)
     items, stats = extractor.extract(input_path)
     if job_dir:
         try:
@@ -457,10 +471,12 @@ def main():
     parser.add_argument('--mineru-result', help='Complete, source-bound normalized MinerU result JSON')
     parser.add_argument('--main-file', help='LaTeX main file relative to project directory')
     parser.add_argument('--source-overlay', help='Source-hash-bound reviewed image text transcriptions; creates additional source IDs before freezing')
+    parser.add_argument('--equation-overlay', help='Reviewed source-bound native equation groups, preserved as complete PDF crops')
     args = parser.parse_args()
     try:
         result = extract_document(args.input, args.out, args.scope, args.summary, args.job_dir,
-                                  args.assets_manifest, args.backend, args.mineru_result, args.main_file, args.source_overlay)
+                                  args.assets_manifest, args.backend, args.mineru_result, args.main_file, args.source_overlay,
+                                  args.equation_overlay)
     except (ValueError, OSError, ImportError) as exc:
         print(f'Extraction failed: {exc}', file=sys.stderr)
         return 4 if isinstance(exc, ImportError) else 2

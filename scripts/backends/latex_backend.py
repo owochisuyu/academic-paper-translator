@@ -14,18 +14,22 @@ import subprocess
 from pathlib import Path
 
 from .common import digest, normalize_with_map, register_syntax_gaps
+from .latex_lex import (command_at, group_end, math_span_end, environment_end,
+                        glue_command_end, skip_space_comments, control_sequence, find_command_start,
+                        LITERAL_ENVIRONMENTS, TEXT_FORMAT_COMMANDS)
 try:
     from ..align_bilingual import split_en_sentences
 except ImportError:
     from align_bilingual import split_en_sentences
 
 MATH_ENVIRONMENTS = {'equation', 'equation*', 'align', 'align*', 'alignat', 'alignat*', 'gather', 'gather*', 'multline', 'multline*', 'displaymath', 'math'}
-TEXT_COMMANDS = {'section', 'subsection', 'subsubsection', 'chapter', 'paragraph', 'title', 'caption', 'footnote'}
-INLINE_PROTECTED = {'cite', 'citep', 'citet', 'ref', 'eqref', 'pageref', 'label', 'url', 'includegraphics', 'ensuremath'}
-FORMATS = {'textbf', 'textit', 'emph', 'textrm', 'textsf', 'texttt', 'underline'}
+TEXT_COMMANDS = {'section', 'subsection', 'subsubsection', 'chapter', 'paragraph', 'title', 'caption', 'footnote', 'footnotetext'}
+INLINE_PROTECTED = {'cite', 'citep', 'citet', 'ref', 'eqref', 'pageref', 'label', 'url', 'includegraphics', 'ensuremath', 'footnotemark', 'verb', 'verb*'}
+FORMATS = TEXT_FORMAT_COMMANDS
 LAYOUT = {'centering', 'hline', 'toprule', 'midrule', 'bottomrule', 'small', 'footnotesize', 'noindent', 'maketitle', 'clearpage', 'newpage'}
 CITATIONS = {'cite', 'citep', 'citet', 'citealt', 'citealp', 'citeauthor', 'citeyear',
              'citeyearpar', 'autocite', 'parencite', 'textcite', 'nocite'}
+MATH_TEXT_COMMANDS = TEXT_FORMAT_COMMANDS | {'intertext', 'shortintertext', 'text', 'mbox'}
 
 
 def uncomment_tex(text):
@@ -43,28 +47,6 @@ def uncomment_tex(text):
         else:
             index += 1
     return ''.join(result)
-
-
-def group_end(text, start, opener='{', closer='}'):
-    if start >= len(text) or text[start] != opener:
-        raise ValueError(f'Expected {opener} at offset {start}')
-    depth, index = 1, start + 1
-    while index < len(text):
-        if text[index] == '\\':
-            index += 2
-            continue
-        if text[index] == '%':
-            newline = text.find('\n', index)
-            index = len(text) if newline < 0 else newline + 1
-            continue
-        if text[index] == opener:
-            depth += 1
-        elif text[index] == closer:
-            depth -= 1
-            if not depth:
-                return index + 1
-        index += 1
-    raise ValueError(f'Unbalanced {opener}{closer} starting at {start}')
 
 
 def bibtex_group_end(text, start, *, entry=False, limit=None):
@@ -119,39 +101,46 @@ def bibtex_quoted_end(text, start, limit):
     raise ValueError(f'Unclosed bibliography quoted field at {start}')
 
 
-def command_at(text, index):
-    match = re.match(r'\\([A-Za-z]+\*?|.)', text[index:], re.S)
-    if not match:
-        return None
-    name, cursor = match.group(1), index + len(match.group())
-    args = []
-    while cursor < len(text):
-        scan = cursor
-        while scan < len(text) and text[scan].isspace():
-            scan += 1
-        if scan >= len(text) or text[scan] not in '[{':
-            break
-        left = text[scan]
-        end = group_end(text, scan, left, ']' if left == '[' else '}')
-        args.append((left, scan + 1, end - 1))
-        cursor = end
-    return name, cursor, args
-
-
 def _required(args):
     return [arg for arg in args if arg[0] == '{']
 
 
 def _environment_end(text, start, name, body_start):
-    token = re.compile(r'\\(begin|end)\s*\{' + re.escape(name) + r'\}')
-    depth = 1
-    for match in token.finditer(text, body_start):
-        if text[max(0, match.start() - 1):match.start()] == '\\':
-            continue
-        depth += 1 if match.group(1) == 'begin' else -1
-        if not depth:
-            return match.start(), match.end()
-    raise ValueError(f'Unclosed LaTeX environment {name} at {start}')
+    return environment_end(text, start, name, body_start)
+
+
+def math_text_spans(text, start, end):
+    """Visible textual arguments in math, excluding operators such as mathrm.
+
+    Nested argument content belongs to its outer text span, so source-export
+    edits remain nonoverlapping. The ordinary protector handles nested markup.
+    """
+    result, index = [], start
+    while index < end:
+        if text[index] == '%':
+            newline = text.find('\n', index, end)
+            index = end if newline < 0 else newline + 1
+        elif text[index] == '\\':
+            token = control_sequence(text, index)
+            if not token:
+                index += 1
+                continue
+            name, after = token
+            if name in MATH_TEXT_COMMANDS:
+                _, stop, args = command_at(text, index)
+                required = _required(args)
+                if required and stop <= end:
+                    _, a, b = required[0]
+                    if re.search(r'[A-Za-z\u4e00-\u9fff]', uncomment_tex(text[a:b])):
+                        result.append((name, a, b))
+                    index = stop
+                    continue
+            # Do not consume math argument groups: text labels can be nested
+            # inside fractions, underbraces, subscripts or other math commands.
+            index = after
+        else:
+            index += 1
+    return result
 
 
 class LatexParser:
@@ -270,24 +259,40 @@ class LatexParser:
             protected[key] = value
             output.append(key)
             positions.extend([(start, end)] * len(key))
+        def readable_segment(start, end):
+            inner, inner_positions, inner_tokens = self.protect(raw[start:end], path, offset + start)
+            remap = {}
+            for key, value in inner_tokens.items():
+                fresh = f'⟦TEX{len(protected) + 1:06d}⟧'
+                remap[key] = fresh
+                protected[fresh] = value
+            inner = re.sub(r'⟦TEX\d{6}⟧', lambda m: remap[m.group()], inner)
+            output.append(inner)
+            positions.extend([(a + start, b + start) for a, b in inner_positions])
         index = 0
         while index < len(raw):
             if raw[index] == '%':
                 end = raw.find('\n', index)
-                end = len(raw) if end < 0 else end
+                # The newline terminates the TeX comment. Keep it inside the
+                # token or whitespace normalization can comment out later prose
+                # when translated source is written back.
+                end = len(raw) if end < 0 else end + 1
                 placeholder(raw[index:end], index, end)
                 index = end
-            elif raw[index] == '$':
-                delim = '$$' if raw.startswith('$$', index) else '$'
-                end = raw.find(delim, index + len(delim))
-                while end > 0 and raw[end - 1] == '\\':
-                    end = raw.find(delim, end + len(delim))
-                if end < 0:
+            elif raw[index] == '$' or raw.startswith(('\\(', '\\['), index):
+                try:
+                    end = math_span_end(raw, index)
+                    labels = math_text_spans(raw, index, end)
+                except ValueError:
                     self.warn('unclosed_inline_math', path, offset + index)
                     end = len(raw)
-                else:
-                    end += len(delim)
-                placeholder(raw[index:end], index, end)
+                    labels = []
+                cursor = index
+                for _, a, b in labels:
+                    placeholder(raw[cursor:a], cursor, a)
+                    readable_segment(a, b)
+                    cursor = b
+                placeholder(raw[cursor:end], cursor, end)
                 index = end
             elif raw[index] == '\\':
                 cmd = command_at(raw, index)
@@ -297,29 +302,16 @@ class LatexParser:
                     continue
                 name, end, args = cmd
                 req = _required(args)
-                if (name in FORMATS and req) or (name == 'href' and len(req) == 2):
+                if (name in FORMATS and req) or (name == 'href' and len(req) == 2) or (name == 'multicolumn' and len(req) == 3):
                     # The visible href label is prose; only its URL and command
                     # wrapper are protected from translation.
-                    _, arg_start, arg_end = req[-1] if name == 'href' else req[0]
+                    _, arg_start, arg_end = req[-1] if name in ('href', 'multicolumn') else req[0]
                     placeholder(raw[index:arg_start], index, arg_start)
-                    # Nested known formatting is retained in a protected inner span if needed.
-                    inner, inner_positions, inner_tokens = self.protect(raw[arg_start:arg_end], path, offset + arg_start)
-                    remap = {}
-                    for key, value in inner_tokens.items():
-                        fresh = f'⟦TEX{len(protected) + 1:06d}⟧'
-                        remap[key] = fresh
-                        protected[fresh] = value
-                    inner = re.sub(r'⟦TEX\d{6}⟧', lambda m: remap[m.group()], inner)
-                    output.append(inner)
-                    positions.extend([(a + arg_start, b + arg_start) for a, b in inner_positions])
+                    readable_segment(arg_start, arg_end)
                     placeholder(raw[arg_end:end], arg_end, end)
                     index = end
-                elif name == '(':
-                    close = raw.find('\\)', end)
-                    if close < 0:
-                        self.warn('unclosed_inline_math', path, offset + index)
-                        close = len(raw) - 2
-                    end = close + 2
+                elif glue_command_end(raw, index) is not None:
+                    end = glue_command_end(raw, index)
                     placeholder(raw[index:end], index, end)
                     index = end
                 elif name in INLINE_PROTECTED or name in LAYOUT or not name[0].isalpha():
@@ -329,7 +321,7 @@ class LatexParser:
                     placeholder(raw[index:end], index, end)
                     self.warn('unsupported_macro', path, offset + index, command=name)
                     index = end
-            elif raw[index] in '{}':
+            elif raw[index] in '{}~&#_^':
                 placeholder(raw[index], index, index + 1)
                 index += 1
             else:
@@ -378,6 +370,16 @@ class LatexParser:
         self.regions.append({'region_id': region_id, 'locator': locator, 'role': kind, 'raw_text': raw,
                              'normalized_text': normalized, 'disposition': action, 'unit_ids': [item['id'] for item in output]})
         return output
+
+    def emit_math(self, path, text, start, end):
+        parents = self.emit(path, text, start, end, 'equation', 'preserve',
+                            {'math_format': 'latex'}, split=False)
+        if not parents:
+            return
+        for name, a, b in math_text_spans(text, start, end):
+            self.emit(path, text, a, b, 'sentence', split=False,
+                      extra={'role': 'math_text', 'math_command': name,
+                             'parent_id': parents[0]['id']})
 
     def parse_file(self, path):
         path = Path(path).resolve()
@@ -504,13 +506,17 @@ class LatexParser:
                 continue
             if text.startswith('$$', index) or text.startswith('\\[', index):
                 flush(index)
-                closing = '$$' if text.startswith('$$', index) else '\\]'
-                stop = text.find(closing, index + 2, end)
-                if stop < 0:
-                    raise ValueError('Unclosed display math')
-                stop += 2
-                self.emit(path, text, index, stop, 'equation', 'preserve', {'math_format': 'latex'}, split=False)
+                stop = math_span_end(text, index, end)
+                self.emit_math(path, text, index, stop)
                 index = plain_start = stop
+                continue
+            if text[index] == '$' or text.startswith('\\(', index):
+                # Inline math is part of this paragraph, not top-level document
+                # structure. Its labels/environments/commands must not flush prose.
+                try:
+                    index = math_span_end(text, index, end)
+                except ValueError:
+                    index = end  # protect() retains and reports the invalid span.
                 continue
             if text[index] != '\\':
                 index += 1
@@ -525,7 +531,8 @@ class LatexParser:
             if simple in TEXT_COMMANDS and required:
                 flush(index)
                 arg = required[-1]
-                kind = 'heading' if simple in ('section', 'subsection', 'subsubsection', 'chapter', 'paragraph', 'title') else simple
+                kind = ('heading' if simple in ('section', 'subsection', 'subsubsection', 'chapter', 'paragraph', 'title')
+                        else 'footnote' if simple == 'footnotetext' else simple)
                 extra = {}
                 if kind == 'heading':
                     self.section_count += 1
@@ -557,7 +564,7 @@ class LatexParser:
                     raise ValueError(f'Environment {env} exceeds parent range')
                 flush(index)
                 if env in MATH_ENVIRONMENTS:
-                    self.emit(path, text, index, close_end, 'equation', 'preserve', {'math_format': 'latex'}, split=False)
+                    self.emit_math(path, text, index, close_end)
                 elif env in ('tabular', 'tabular*', 'longtable'):
                     self.table_cells(path, text, stop, close_start)
                 elif env in ('figure', 'figure*'):
@@ -596,8 +603,14 @@ class LatexParser:
                     self.parse_range(path, text, stop, close_start)
                     self.current_table = previous
                 elif env == 'thebibliography':
-                    self.parse_range(path, text, stop, close_start, reference=True)
-                elif env in ('document', 'abstract', 'itemize', 'enumerate', 'description', 'quote', 'center', 'minipage'):
+                    # Generated BBL setup is not a bibliographic entry. Keep its
+                    # original definitions, but do not send their bodies to a
+                    # translator as if they were a printed reference.
+                    first = find_command_start(text, stop, close_start, 'bibitem')
+                    body_start = first if first is not None else close_start
+                    self.bibliography_setup(path, text, stop, body_start)
+                    self.parse_range(path, text, body_start, close_start, reference=True)
+                elif env in ('document', 'abstract', 'itemize', 'enumerate', 'description', 'quote', 'center', 'minipage', 'subequations', 'appendices'):
                     self.parse_range(path, text, stop, close_start, reference=reference)
                 elif env in ('verbatim', 'lstlisting', 'minted'):
                     self.emit(path, text, index, close_end, 'code', 'preserve', split=False)
@@ -608,8 +621,8 @@ class LatexParser:
             elif simple == 'bibitem':
                 flush(index)
                 self.reference_count += 1
-                next_item = re.search(r'\\bibitem\b', text[stop:end])
-                finish = stop + next_item.start() if next_item else end
+                next_item = find_command_start(text, stop, end, 'bibitem')
+                finish = next_item if next_item is not None else end
                 self.emit(path, text, stop, finish, 'reference', split=False,
                           extra={'id': f'ref-{self.reference_count:03d}', 'bibliography_key': text[required[-1][1]:required[-1][2]] if required else ''})
                 index = plain_start = finish
@@ -623,6 +636,29 @@ class LatexParser:
                 index = max(index + 1, stop)
         flush(end)
 
+    def bibliography_setup(self, path, text, start, end):
+        """Retain BBL declarations and flag unverified executable setup explicitly."""
+        index = start
+        definitions = {'newcommand', 'renewcommand', 'providecommand', 'DeclareRobustCommand'}
+        while index < end:
+            index = skip_space_comments(text, index, end)
+            if index >= end:
+                break
+            command = command_at(text, index) if text[index] == '\\' else None
+            if command and command[0].rstrip('*') in definitions:
+                index = min(command[1], end)
+                continue
+            stop = command[1] if command else end
+            if command and command[0] == 'csname':
+                match = re.search(r'\\endcsname\b', text[stop:end])
+                stop = stop + match.end() if match else end
+            stop = min(stop, end)
+            self.emit(path, text, index, stop, 'code', 'preserve', split=False,
+                      extra={'role': 'bibliography_setup'})
+            self.warn('unsupported_bibliography_setup', path, index,
+                      command=command[0] if command else None)
+            index = stop
+
     def table_cells(self, path, text, start, end):
         table_id = self.current_table
         if not table_id:
@@ -632,15 +668,28 @@ class LatexParser:
         cells = []
         def emit_cell(stop):
             nonlocal cell_start
-            fragment = text[cell_start:stop]
-            # Rule commands are layout; their source project text is preserved.
-            fragment_start = cell_start
-            prefix = re.match(r'\s*(?:(?:\\(?:hline|toprule|midrule|bottomrule))\s*)*', fragment)
-            fragment_start += prefix.end()
+            # Comments and rules before a cell belong to copied source syntax.
+            # In particular, an entirely commented-out row is never a cell.
+            fragment_start = skip_space_comments(text, cell_start, stop)
+            while fragment_start < stop:
+                rule = re.match(r'\\(?:hline|toprule|midrule|bottomrule)\b', text[fragment_start:stop])
+                if not rule:
+                    break
+                fragment_start = skip_space_comments(text, fragment_start + rule.end(), stop)
+            colspan = 1
+            command = command_at(text, fragment_start) if text[fragment_start:stop].startswith('\\multicolumn') else None
+            if command and command[0] == 'multicolumn':
+                req = _required(command[2])
+                count = text[req[0][1]:req[0][2]].strip() if req else ''
+                trailing = skip_space_comments(text, min(command[1], stop), stop)
+                if len(req) == 3 and count.isdecimal() and 1 <= int(count) <= 1000 and trailing == stop:
+                    colspan = int(count)
+                else:
+                    self.warn('unsupported_table_span', path, fragment_start)
             if text[fragment_start:stop].strip():
                 emitted = self.emit(path, text, fragment_start, stop, 'table_cell', split=False,
                                     extra={'id': f'{table_id}-cell-r{row + 1}c{col + 1}', 'table_id': table_id,
-                                           'parent_id': table_id, 'row': row, 'col': col, 'rowspan': 1, 'colspan': 1})
+                                           'parent_id': table_id, 'row': row, 'col': col, 'rowspan': 1, 'colspan': colspan})
                 cells.extend(emitted)
             else:
                 locator = {'file': path.relative_to(self.root).as_posix(), 'start': stop, 'end': stop}
@@ -650,15 +699,39 @@ class LatexParser:
                          'empty_cell': True, 'status': 'pending'}
                 self.items.append(empty)
                 cells.append(empty)
+            return colspan
         while index < end:
-            if text[index] == '\\':
+            if text[index] == '%':
+                newline = text.find('\n', index, end)
+                index = end if newline < 0 else newline + 1
+            elif text[index] == '$' or text.startswith(('\\(', '\\['), index):
+                try:
+                    index = math_span_end(text, index, end)
+                except ValueError:
+                    self.warn('unclosed_table_math', path, index)
+                    index = end
+            elif text[index] == '\\':
                 if text.startswith('\\\\', index) and depth == 0:
                     emit_cell(index)
                     row, col = row + 1, 0
                     index += 2
+                    # Optional row spacing is layout, not the next cell's prose.
+                    if index < end and text[index] == '*':
+                        index += 1
+                    spacing = skip_space_comments(text, index, end)
+                    if spacing < end and text[spacing] == '[':
+                        index = group_end(text, spacing, '[', ']')
                     cell_start = index
                 else:
-                    index += 2
+                    command = command_at(text, index)
+                    if command and command[0].rstrip('*') == 'verb':
+                        index = command[1]
+                    elif command and command[0] == 'begin' and _required(command[2]):
+                        req = _required(command[2])
+                        name = text[req[0][1]:req[0][2]]
+                        _, index = _environment_end(text, index, name, command[1])
+                    else:
+                        index += 2
             elif text[index] == '{':
                 depth += 1
                 index += 1
@@ -666,17 +739,21 @@ class LatexParser:
                 depth -= 1
                 index += 1
             elif text[index] == '&' and depth == 0:
-                emit_cell(index)
-                col += 1
+                col += emit_cell(index)
                 index += 1
                 cell_start = index
             else:
                 index += 1
-        if text[cell_start:end].strip() and not re.fullmatch(r'\s*(?:\\(?:hline|bottomrule)\s*)*', text[cell_start:end]):
+        tail = uncomment_tex(text[cell_start:end])
+        if tail.strip() and not re.fullmatch(r'\s*(?:\\(?:hline|bottomrule)\s*)*', tail):
             emit_cell(end)
         for cell in cells:
             cell['table_rows'] = max(c['row'] for c in cells) + 1
-            cell['table_cols'] = max(c['col'] for c in cells) + 1
+            cell['table_cols'] = max(c['col'] + c['colspan'] for c in cells)
+        widths = {row_no: max(c['col'] + c['colspan'] for c in cells if c['row'] == row_no)
+                  for row_no in {c['row'] for c in cells}}
+        if len(set(widths.values())) > 1:
+            self.warn('inconsistent_table_rows', path, start, row_widths=widths)
 
 
 def discover_main(path, main_file=None):

@@ -19,9 +19,11 @@ The scripts organize and check the work; they do not perform semantic translatio
 - **PDF**: native text/geometry extraction and Typst reflow. Every image/scan region
   has an explicit disposition; a native header never proves its body was read.
 - **Markdown**: structured headings, paragraphs, lists, pipe tables, and code.
-- **LaTeX**: bounded structural extraction, protected tokens, and source-project
-  export. Unknown constructs remain visible as review items. Full source PDF
-  compilation requires an installed compatible TeX engine and Chinese fonts.
+- **LaTeX**: use source extraction/export for supported constructs. For custom
+  macros, generated text, conditional branches or unsupported environments, compile
+  a source copy with a real TeX engine and import its PDF into the normal translation
+  workflow. Read [latex_protocol.md](references/latex_protocol.md). Compilation
+  resolves what is printed; it does not replace source/visual or translation review.
 - **Scans/complex PDFs**: prepare image-reading packets for the current vision agent,
   independently check the transcription, then import a source overlay into a new job.
   See [ocr_protocol.md](references/ocr_protocol.md). A complete, source-bound saved
@@ -57,6 +59,11 @@ versions used in verification are recorded there, not assumed installed everywhe
    compares its transcription with those images before `--source-overlay` import.
    Saving an image does not translate its labels. Do not edit `source.jsonl` to erase
    a warning.
+
+   For complex LaTeX, switch to the compiled-PDF route when static extraction cannot
+   establish the printed content. Retain source snapshots, compiler logs, the PDF
+   and every explicit compatibility adaptation. Do not translate inactive branches
+   as part of the visible paper or waive an unknown macro to make a check pass.
 
 2. **Set terminology and prepare context packets.** Write approved terms into
    `glossary.json` where useful, then prepare work for the current agent.
