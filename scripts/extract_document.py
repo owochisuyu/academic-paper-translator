@@ -20,6 +20,27 @@ except ImportError:
 
 FIGURE_CAPTION_REGEX = re.compile(r'^(?:Fig\.|Figure|Supplementary\s+Figure)\s*([A-Za-z0-9_.-]+)', re.I)
 TABLE_CAPTION_REGEX = re.compile(r'^(?:Table|Tab\.)\s*([A-Za-z0-9_.-]+)', re.I)
+
+PROSE_LEAD_WORDS = {
+    'shows', 'show', 'showing', 'shown',
+    'presents', 'present', 'presenting', 'presented',
+    'illustrates', 'illustrate', 'illustrating', 'illustrated',
+    'summarizes', 'summarize', 'summarizing', 'summarized',
+    'compares', 'compare', 'comparing', 'compared',
+    'depicts', 'depict', 'depicting', 'depicted',
+    'lists', 'list', 'listing', 'listed',
+    'gives', 'give', 'giving', 'given',
+    'demonstrates', 'demonstrate', 'demonstrating', 'demonstrated',
+    'displays', 'display', 'displaying', 'displayed',
+    'reports', 'report', 'reporting', 'reported',
+    'provides', 'provide', 'providing', 'provided',
+    'indicates', 'indicate', 'indicating', 'indicated',
+    'plots', 'plot', 'plotting', 'plotted',
+    'evaluates', 'evaluate', 'evaluating', 'evaluated',
+    'is', 'are', 'was', 'were', 'be', 'been',
+    'further', 'also', 'can', 'could', 'should', 'would', 'may', 'might',
+    'and', 'or', 'as', 'in', 'with', 'by', 'for', 'to', 'from', 'at'
+}
 SECTION_HEADING_REGEX = re.compile(r'^(?:[0-9]+(?:\.[0-9]+)*\.?\s+[A-Z]|[A-Z]\.\s+[A-Z]|Abstract|Introduction|Related\s+Work|Method|Background|Results|Discussion|Conclusion|Acknowledg|References|Bibliography|Appendix)', re.I)
 REFERENCE_LINE_REGEX = re.compile(r'^\[\s*\d+\s*\]\s+')
 EQUATION_LINE_REGEX = re.compile(r'\(\s*([0-9]+[a-z]?)\s*\)\s*$')
@@ -232,7 +253,7 @@ class DocumentExtractor:
             except ImportError:
                 from extract_figures import extract_figures
             self.assets = extract_figures(str(pdf_path), str(self.asset_dir), dpi=250)
-        items, figure_counts = [], {}
+        items, figure_counts, table_counts = [], {}, {}
         section, sec_idx, ref_idx = 'Title & Abstract', 0, 0
         try:
             from .backends.pdf_structure import refine_table, repeated_running_matter
@@ -340,6 +361,18 @@ class DocumentExtractor:
                             'parent_id': region_id, 'raw_source': raw, 'normalization_map': mapping, 'status': 'pending'}
                     figure_match = FIGURE_CAPTION_REGEX.match(normalized)
                     table_match = TABLE_CAPTION_REGEX.match(normalized)
+                    if figure_match:
+                        rest = normalized[figure_match.end():].strip()
+                        if rest:
+                            first_word = re.split(r'[\s\u2002\u2003\t\n.:,;-]+', rest)[0].lower()
+                            if first_word in PROSE_LEAD_WORDS:
+                                figure_match = None
+                    if table_match:
+                        rest = normalized[table_match.end():].strip()
+                        if rest:
+                            first_word = re.split(r'[\s\u2002\u2003\t\n.:,;-]+', rest)[0].lower()
+                            if first_word in PROSE_LEAD_WORDS:
+                                table_match = None
                     if page_no == 1 and max_font >= 15 and len(normalized) < 220 and not any(i['kind'] == 'title' for i in items):
                         group = [{**base, 'id': 'document-title', 'kind': 'title', 'source': normalized}]
                     elif heading:
@@ -367,7 +400,9 @@ class DocumentExtractor:
                         number = table_match.group(1).rstrip('.:,;-')
                         ordered = sorted(table_info, key=lambda t: min(abs(t[1].y0 - rect.y1), abs(rect.y0 - t[1].y1)))
                         table_id = ordered[0][0] if ordered else f'p{page_no}-unparsed-table-{number}'
-                        group = [{**base, 'id': f'{table_id}-cap', 'kind': 'table', 'table_id': table_id, 'table_no': number, 'source': normalized}]
+                        table_counts[table_id] = table_counts.get(table_id, 0) + 1
+                        cap_id = f'{table_id}-cap' + (f'-{table_counts[table_id]}' if table_counts[table_id] > 1 else '')
+                        group = [{**base, 'id': cap_id, 'kind': 'table', 'table_id': table_id, 'table_no': number, 'source': normalized}]
                         if not ordered:
                             self.warnings.append({'code': 'table_structure_unavailable', 'id': group[0]['id'], 'page': page_no})
                     elif 'reference' in section.casefold() or 'bibliography' in section.casefold() or REFERENCE_LINE_REGEX.match(normalized):

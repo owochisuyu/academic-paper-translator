@@ -22,6 +22,27 @@ FIGURE_CAPTION_REGEX = re.compile(
     r'(?:Fig\.|Figure|Supplementary\s+Figure)[\s\u202f]*([A-Za-z0-9_.-]+)',
     re.IGNORECASE
 )
+PROSE_LEAD_WORDS = {
+    'shows', 'show', 'showing', 'shown',
+    'presents', 'present', 'presenting', 'presented',
+    'illustrates', 'illustrate', 'illustrating', 'illustrated',
+    'summarizes', 'summarize', 'summarizing', 'summarized',
+    'compares', 'compare', 'comparing', 'compared',
+    'depicts', 'depict', 'depicting', 'depicted',
+    'lists', 'list', 'listing', 'listed',
+    'gives', 'give', 'giving', 'given',
+    'demonstrates', 'demonstrate', 'demonstrating', 'demonstrated',
+    'displays', 'display', 'displaying', 'displayed',
+    'reports', 'report', 'reporting', 'reported',
+    'provides', 'provide', 'providing', 'provided',
+    'indicates', 'indicate', 'indicating', 'indicated',
+    'plots', 'plot', 'plotting', 'plotted',
+    'evaluates', 'evaluate', 'evaluating', 'evaluated',
+    'is', 'are', 'was', 'were', 'be', 'been',
+    'further', 'also', 'can', 'could', 'should', 'would', 'may', 'might',
+    'and', 'or', 'as', 'in', 'with', 'by', 'for', 'to', 'from', 'at'
+}
+
 
 
 def sanitize_filename(identifier: str) -> str:
@@ -106,6 +127,12 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
                     continue
                 line_rect = pymupdf.Rect(line["bbox"])
                 m = FIGURE_CAPTION_REGEX.match(line_text)
+                if m:
+                    rest = line_text[m.end():].strip()
+                    if rest:
+                        first_word = re.split(r'[\s\u2002\u2003\t\n.:,;-]+', rest)[0].lower()
+                        if first_word in PROSE_LEAD_WORDS:
+                            m = None
                 if m:
                     if current_cap:
                         captions.append(current_cap)
