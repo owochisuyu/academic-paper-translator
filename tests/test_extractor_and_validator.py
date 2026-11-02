@@ -212,7 +212,7 @@ class TestDocumentExtractor(unittest.TestCase):
         has_heading = any(item["kind"] == "heading" and "head" in item["id"] for item in items)
         has_sentence = any(item["kind"] == "sentence" and "-s001" in item["id"] for item in items)
         has_figure = any(item["kind"] == "figure" and item["id"] == "fig-1-cap" for item in items)
-        has_ref = any(item["kind"] == "reference" and item["id"] == "ref-001" for item in items)
+        has_ref = any(item["kind"] == "reference" and item["id"].endswith("ref-001") for item in items)
 
         self.assertTrue(has_heading, "Should contain heading item with stable ID.")
         self.assertTrue(has_sentence, "Should contain sentence item with stable ID.")

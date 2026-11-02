@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import copy
 import re
 import pymupdf
 
@@ -44,16 +45,86 @@ def repeated_running_matter(document):
 
 
 def native_lines(page):
+    """Read lines with exact character intervals in their original PDF block."""
     result = []
-    for block in page.get_text('dict')['blocks']:
+    page_number = getattr(page, 'number', 0) + 1
+    page_rect = getattr(page, 'rect', None)
+    for block_index, block in enumerate(page.get_text('dict')['blocks']):
         if block.get('type') != 0:
             continue
-        for line in block.get('lines', []):
+        block_id = block.get('number', block_index)
+        cursor = 0
+        for line_index, line in enumerate(block.get('lines', [])):
+            if line_index:
+                cursor += 1
             text = ''.join(s.get('text', '') for s in line.get('spans', []))
+            start, cursor = cursor, cursor + len(text)
             if text.strip():
+                locator = {'page': page_number, 'block_id': block_id,
+                           'region_id': f'p{page_number}:b{block_id}',
+                           'bbox': list(line['bbox']), 'start': start, 'end': cursor,
+                           'rotation': getattr(page, 'rotation', 0),
+                           'coordinate_system': 'unrotated_top_left_pt'}
+                if page_rect is not None:
+                    locator.update(width=page_rect.width, height=page_rect.height)
                 result.append({'text': text, 'bbox': pymupdf.Rect(line['bbox']),
-                               'baseline': line['spans'][0].get('origin', [0, line['bbox'][3]])[1]})
+                               'baseline': line['spans'][0].get('origin', [0, line['bbox'][3]])[1],
+                               'locator': locator, 'spans': copy.deepcopy(line.get('spans', []))})
     return result
+
+
+def _vertical_rules(page):
+    """Read observed separators; their absence alone never establishes a span."""
+    if not hasattr(page, 'get_drawings'):
+        return None
+    rules = []
+    for drawing in page.get_drawings():
+        for item in drawing.get('items', []):
+            if item[0] == 'l':
+                first, second = item[1:3]
+                if abs(first.x - second.x) < .5:
+                    rules.append((float((first.x + second.x) / 2), min(first.y, second.y), max(first.y, second.y)))
+            elif item[0] == 're':
+                box = pymupdf.Rect(item[1])
+                rules.extend([(box.x0, box.y0, box.y1), (box.x1, box.y0, box.y1)])
+    return rules
+
+
+def _spanning_row_boxes(row, lines, vertical_rules):
+    """Recover a contiguous native line crossing an artificial column split.
+
+    Require shared row geometry and no drawn separator through this row. A real
+    vertical rule wins over text that happens to span a boundary; it needs a more
+    detailed extraction instead of silently merging distinct cells.
+    """
+    boxes = [pymupdf.Rect(box) if box is not None else None for box in row.cells]
+    if vertical_rules is None:
+        return boxes
+    for line in lines:
+        glyph = line['bbox']
+        candidates = [i for i, box in enumerate(boxes) if box is not None
+                      and box.y0 - .2 <= line['baseline'] <= box.y1 + .2
+                      and min(glyph.x1, box.x1) - max(glyph.x0, box.x0) > .5]
+        if len(candidates) < 2:
+            continue
+        first = candidates[0]
+        selected = [boxes[i] for i in candidates]
+        if (any(abs(box.y0 - selected[0].y0) > .2 or abs(box.y1 - selected[0].y1) > .2 for box in selected)
+                or any(abs(left.x1 - right.x0) > .2 for left, right in zip(selected, selected[1:]))):
+            continue
+        # A completely unruled table may have two legitimate adjacent labels in
+        # one native line. Only recover an omitted rule when the same separator
+        # is actually drawn elsewhere in this table.
+        if any(not any(abs(x - left.x1) <= .75 for x, _, _ in vertical_rules)
+               for left in selected[:-1]):
+            continue
+        if any(abs(x - left.x1) <= .75 and min(y1, left.y1) - max(y0, left.y0) > .5
+               for left in selected[:-1] for x, y0, y1 in vertical_rules):
+            continue
+        for index in candidates[1:]:
+            boxes[first] |= boxes[index]
+            boxes[index] = None
+    return boxes
 
 
 def refine_table(table, page, table_id):
@@ -65,12 +136,18 @@ def refine_table(table, page, table_id):
     identifier tokens; other multiline cells remain intact and are flagged.
     """
     lines = native_lines(page)
+    vertical_rules = _vertical_rules(page)
     old_grid = table.extract()
     output, warnings, logical_row = [], [], 0
+    crossing_fragments = set()
     table_box = pymupdf.Rect(table.bbox)
+    if vertical_rules is not None:
+        vertical_rules = [(x, y0, y1) for x, y0, y1 in vertical_rules
+                          if table_box.x0 - 1 <= x <= table_box.x1 + 1
+                          and min(y1, table_box.y1) - max(y0, table_box.y0) > .5]
     for row_index, row in enumerate(table.rows):
         columns = []
-        for col_index, raw_box in enumerate(row.cells):
+        for col_index, raw_box in enumerate(_spanning_row_boxes(row, lines, vertical_rules)):
             if raw_box is None:
                 columns.append(None)
                 continue
@@ -79,8 +156,18 @@ def refine_table(table, page, table_id):
             for line in lines:
                 glyph_box = line['bbox']
                 x = (glyph_box.x0 + glyph_box.x1) / 2
-                y = (glyph_box.y0 + glyph_box.y1) / 2
-                if box.x0 - .2 <= x <= box.x1 + .2 and box.y0 - .2 <= y <= box.y1 + .2:
+                # Large math delimiters have font boxes protruding above their
+                # row. Their printed baseline still belongs to the correct row.
+                y = line['baseline']
+                if box.x0 <= x < box.x1 and box.y0 <= y < box.y1:
+                    if glyph_box.x0 < box.x0 - .5 or glyph_box.x1 > box.x1 + .5:
+                        identity = (line['locator']['block_id'], line['locator']['start'], line['locator']['end'])
+                        if identity not in crossing_fragments:
+                            crossing_fragments.add(identity)
+                            warnings.append({'code': 'table_text_crosses_cell_boundary', 'table_id': table_id,
+                                             'detected_row': row_index, 'col': col_index,
+                                             'native_locator': copy.deepcopy(line['locator'])})
+                        continue
                     assigned.append(line)
             assigned.sort(key=lambda x: (x['baseline'], x['bbox'].x0))
             columns.append((box, assigned))
@@ -113,14 +200,22 @@ def refine_table(table, page, table_id):
                     cell_box = box
                     if value:
                         warnings.append({'code': 'table_text_geometry_unavailable', 'table_id': table_id, 'detected_row': row_index, 'col': col_index})
-                output.append({'row': logical_row, 'col': col_index, 'source': value, 'bbox': list(cell_box),
-                               'rowspan': 1, 'colspan': 1, 'recovered_row_split': split})
+                cell = {'row': logical_row, 'col': col_index, 'source': value, 'bbox': list(cell_box),
+                        'grid_bbox': list(box), 'rowspan': 1, 'colspan': 1, 'recovered_row_split': split}
+                if selected:
+                    parts = [{'source': normalize_with_map(line['text'])[0], 'raw_source': line['text'],
+                              'locators': [copy.deepcopy(line['locator'])], 'spans': copy.deepcopy(line['spans'])}
+                             for line in selected]
+                    cell.update(source_parts=parts,
+                                native_locators=[loc for part in parts for loc in part['locators']],
+                                native_spans=[span for part in parts for span in part['spans']])
+                output.append(cell)
             logical_row += 1
     xs = sorted({round(v, 2) for row in table.rows for b in row.cells if b for v in (b[0], b[2])})
     for cell in output:
-        cell['colspan'] = max(1, sum(cell['bbox'][0] + .1 < x <= cell['bbox'][2] + .1 for x in xs))
+        cell['colspan'] = max(1, sum(cell['grid_bbox'][0] + .1 < x <= cell['grid_bbox'][2] + .1 for x in xs))
         cell['table_rows'] = logical_row
-        cell['table_cols'] = max(c['col'] for c in output) + 1
+        cell['table_cols'] = max(len(row.cells) for row in table.rows)
     return output, table_box, warnings
 
 

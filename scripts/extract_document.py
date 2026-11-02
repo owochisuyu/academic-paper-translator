@@ -160,6 +160,13 @@ class DocumentExtractor:
             except ImportError:
                 from backends.pdf_order import order_pdf_units
             items = order_pdf_units(items, self.assets)
+            if self.backend == 'native':
+                try:
+                    from .backends.pdf_references import reconcile_numbered_references
+                except ImportError:
+                    from backends.pdf_references import reconcile_numbered_references
+                items, reference_info = reconcile_numbered_references(items, self.regions, self.warnings)
+                self.extra_document['reference_reconciliation'] = reference_info
             try:
                 from .backends.pdf_structure import merge_hanging_references, merge_page_continuations, normalize_line_wraps
             except ImportError:
@@ -257,10 +264,14 @@ class DocumentExtractor:
                         region_id = f'p{page_no}:table{index + 1}:r{row_no}c{col_no}'
                         locator = {**page_meta, 'region_id': region_id, 'bbox': bbox, 'start': 0, 'end': len(raw)}
                         item = {**cell, 'id': cell_id, 'kind': 'table_cell', 'table_id': table_id, 'parent_id': table_id,
-                                'section': section, 'page': page_no, 'spans': [{'bbox': bbox}], 'locators': [locator],
+                                'section': section, 'page': page_no,
+                                'spans': cell.get('native_spans', [{'bbox': bbox}]),
+                                'locators': cell.get('native_locators', [locator]),
                                 'source': normalized, 'raw_source': raw, 'normalization_map': mapping,
                                 'action': 'translate' if normalized else 'preserve', 'empty_cell': not normalized, 'status': 'pending'}
                         item.pop('bbox', None)
+                        item.pop('native_spans', None)
+                        item.pop('native_locators', None)
                         cell_items.append(item)
                         self.regions.append({'region_id': region_id, 'locator': locator, 'role': 'table_cell',
                                              'raw_text': raw, 'disposition': item['action'], 'unit_ids': [cell_id]})
@@ -314,7 +325,7 @@ class DocumentExtractor:
                     if containing_table:
                         owners = [c['id'] for c in containing_table[2] if (rect & pymupdf.Rect(c['spans'][0]['bbox'])).get_area() > 0]
                         for cell in containing_table[2]:
-                            if cell['id'] in owners:
+                            if cell['id'] in owners and not cell.get('source_parts'):
                                 cell['locators'][0]['block_id'] = min(block_id, cell['locators'][0].get('block_id', block_id))
                         region.update(role='table_text', disposition='preserve', unit_ids=owners,
                                       evidence={'reason': 'Represented by positioned table cells', 'table_id': containing_table[0]})

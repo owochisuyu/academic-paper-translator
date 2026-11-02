@@ -184,6 +184,45 @@ def _claim(text: str, blocks: list[dict], candidate_indices: list[int]) -> bool:
     return False
 
 
+def _claim_located(item: dict, blocks: list[dict], page: int):
+    """Claim an exact native block interval; never fall back on a false locator.
+
+    A small glyph such as ``1`` can overlap a neighbouring mathematical block.
+    Geometric substring matching must not consume that neighbour's occurrence
+    when the extractor already supplied the actual block and character offset.
+    Legacy/third-party units without native intervals retain the geometric route.
+    """
+    locations = _locations(item)
+    explicit = [loc for loc in locations if loc.get('page', page) == page
+                and 'block_id' in loc and ('start' in loc or 'end' in loc)]
+    if not explicit:
+        return None
+    if len(locations) != 1 or len(explicit) != 1:
+        return False
+    locator = explicit[0]
+    number, start, end = locator.get('block_id'), locator.get('start'), locator.get('end')
+    if type(number) is not int or type(start) is not int or type(end) is not int:
+        return False
+    candidates = [block for block in blocks if block['block_id'] == number]
+    if len(candidates) != 1:
+        return False
+    block = candidates[0]
+    raw = block['canonical_text']
+    if (not 0 <= start < end <= len(raw)
+            or raw[start:end] != item.get('raw_source', item.get('source', ''))
+            or not _geometric_candidate(item, block, page)):
+        return False
+    before, selected, after = (normalize_source(raw[:start]), normalize_source(raw[start:end]),
+                               normalize_source(raw[end:]))
+    if before + selected + after != block['normalized']:
+        return False
+    first, last = len(before), len(before) + len(selected)
+    if not selected or any(block['covered'][first:last]):
+        return False
+    block['covered'][first:last] = [True] * len(selected)
+    return True
+
+
 def scan_candidates(page, page_num: int, source_items: list[dict], regions: list[dict] | None = None) -> list[dict]:
     """Report image regions needing OCR/label review, including header-only pages."""
     candidates = []
@@ -443,9 +482,13 @@ def validate_source_coverage(source_items: list[dict], doc_path=None, regions=No
             for page_index, page in enumerate(doc):
                 page_num = page_index + 1
                 blocks = []
+                canonical = {b.get('number', n): '\n'.join(''.join(s.get('text', '') for s in line.get('spans', []))
+                             for line in b.get('lines', []))
+                             for n, b in enumerate(page.get_text('dict').get('blocks', [])) if b.get('type') == 0}
                 for raw in native_pages[page_num]:
                     text = normalize_source(raw[4])
                     blocks.append({'bbox': list(raw[:4]), 'text': raw[4], 'normalized': text,
+                                   'block_id': raw[5], 'canonical_text': canonical.get(raw[5], raw[4].rstrip('\n')),
                                    'covered': [False] * len(text)})
                 p_items = [i for i in native_parts if page_num in _pages(i)]
                 # Explicit exclusions can cover repeated headers, never inferred by
@@ -472,12 +515,14 @@ def validate_source_coverage(source_items: list[dict], doc_path=None, regions=No
                     text = normalize_source(item.get('raw_source', item.get('source', '')))
                     if not text:
                         continue
-                    candidates = [i for i, block in enumerate(blocks) if _geometric_candidate(item, block, page_num)]
-                    matched = _claim(text, blocks, candidates)
+                    is_transcribed = item.get('provenance') in ('ocr', 'manual') or item.get('extraction_method') in ('ocr', 'manual_transcription') or any(loc.get('method') in ('ocr', 'manual_transcription') for loc in _locations(item))
+                    matched = None if is_transcribed else _claim_located(item, blocks, page_num)
+                    if matched is None:
+                        candidates = [i for i, block in enumerate(blocks) if _geometric_candidate(item, block, page_num)]
+                        matched = _claim(text, blocks, candidates)
                     if not matched:
                         # OCR text exists in an image, not the native text layer.
                         # Its source provenance is checked in the extraction ledger.
-                        is_transcribed = item.get('provenance') in ('ocr', 'manual') or item.get('extraction_method') in ('ocr', 'manual_transcription') or any(loc.get('method') in ('ocr', 'manual_transcription') for loc in _locations(item))
                         if not is_transcribed:
                             report['unmatched_source_items'].append({'id': item.get('id'), 'page': page_num,
                                                                      'source': item.get('source', '')[:120]})

@@ -86,34 +86,45 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
         # 3. Gather text blocks and identify figure captions
         raw_blocks = page.get_text("blocks")
         text_blocks = []
-        captions = []
-
         for b in raw_blocks:
-            # b: (x0, y0, x1, y1, text, block_no, block_type)
             if len(b) > 6 and b[6] != 0:
-                # Non-text block (image block in text dict)
                 continue
-            text = b[4].strip()
-            if not text:
+            t_txt = b[4].strip()
+            if not t_txt:
                 continue
-            b_rect = pymupdf.Rect(b[:4])
-            text_blocks.append((b_rect, text))
+            text_blocks.append((pymupdf.Rect(b[:4]), t_txt))
 
-            # Check if block contains or starts with a figure caption pattern
-            m = FIGURE_CAPTION_REGEX.search(text)
-            if m:
-                # Ensure the match occurs near the beginning of the block
-                # to avoid matching in-text cross-references like "as shown in Fig. 1"
-                match_start = m.start()
-                first_line = text.split("\n", 1)[0].strip()
-                if match_start < 10 or FIGURE_CAPTION_REGEX.match(first_line):
+        captions = []
+        page_dict = page.get_text("dict")
+        for b in page_dict.get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            current_cap = None
+            for line in b.get("lines", []):
+                line_text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+                if not line_text:
+                    continue
+                line_rect = pymupdf.Rect(line["bbox"])
+                m = FIGURE_CAPTION_REGEX.match(line_text)
+                if m:
+                    if current_cap:
+                        captions.append(current_cap)
                     fig_id = m.group(1).rstrip(".:,;-")
-                    captions.append({
+                    current_cap = {
                         "fig_id": fig_id,
-                        "rect": b_rect,
-                        "text": text,
+                        "rect": line_rect,
+                        "text": line_text,
                         "raw_block": b
-                    })
+                    }
+                elif current_cap:
+                    if abs(line_rect.x0 - current_cap["rect"].x0) < 60.0 and line_rect.y0 >= current_cap["rect"].y0 - 2.0:
+                        current_cap["rect"] |= line_rect
+                        current_cap["text"] += " " + line_text
+                    else:
+                        captions.append(current_cap)
+                        current_cap = None
+            if current_cap:
+                captions.append(current_cap)
 
         if not captions:
             continue
@@ -163,6 +174,24 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
                 col_x0 = 0.46 * page_w
                 col_x1 = 0.97 * page_w
 
+            # Opposite-column captions establish a real gutter. Do not clamp col_x1
+            # to short text line ends, but strictly bound by the opposite column's x0.
+            strict_column = False
+            if is_left_col:
+                right_edges = [other['rect'].x0 for other in captions
+                               if other is not cap and other['rect'].x0 >= .45 * page_w
+                               and other['rect'].x0 > cap_rect.x1]
+                if right_edges:
+                    col_x1 = min(col_x1, min(right_edges) - 2.0)
+                    strict_column = True
+            elif is_right_col:
+                left_edges = [other['rect'].x1 for other in captions
+                              if other is not cap and other['rect'].x1 <= .55 * page_w
+                              and other['rect'].x1 < cap_rect.x0]
+                if left_edges:
+                    col_x0 = max(col_x0, max(left_edges) + 2.0)
+                    strict_column = True
+
             # Filter graphics belonging to this figure (located above the caption)
             matched_graphics = []
             for gr in all_graphics:
@@ -170,6 +199,8 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
                 if gr.y1 > cap_rect.y0 + 8.0:
                     continue
                 if gr.y0 < prev_cap_bottom:
+                    continue
+                if strict_column and (gr.x0 < col_x0 - .5 or gr.x1 > col_x1 + .5):
                     continue
 
                 # Horizontal check: must overlap with caption column
@@ -200,6 +231,8 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
                     # Must be above caption and below previous caption
                     if tb_rect.y1 > cap_rect.y0 + 2.0 or tb_rect.y0 < prev_cap_bottom:
                         continue
+                    if strict_column and (tb_rect.x0 < col_x0 - .5 or tb_rect.x1 > col_x1 + .5):
+                        continue
 
                     # Check if text block is inside or adjacent to graphics rectangle
                     is_vertically_inside = (tb_rect.y0 >= fig_rect.y0 - 25.0 and tb_rect.y1 <= fig_rect.y1 + 25.0)
@@ -222,6 +255,8 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
                         continue
                     if tb_rect.y1 >= cap_rect.y0 - 5.0:
                         continue
+                    if strict_column and (tb_rect.x0 < col_x0 - .5 or tb_rect.x1 > col_x1 + .5):
+                        continue
                     overlap_x = max(0.0, min(col_x1, tb_rect.x1) - max(col_x0, tb_rect.x0))
                     if overlap_x > 30.0 and tb_rect.y1 > top_y and tb_rect.y1 < cap_rect.y0 - 15.0:
                         # Only body paragraphs with sentence-like text set the top boundary
@@ -235,6 +270,8 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
             x0 = max(0.0, fig_rect.x0 - padding)
             y0 = max(0.0, max(prev_cap_bottom, fig_rect.y0 - padding))
             x1 = min(page_w, fig_rect.x1 + padding)
+            if strict_column:
+                x0, x1 = max(x0, col_x0), min(x1, col_x1)
             y1 = min(cap_rect.y0 - 1.5, fig_rect.y1 + padding)
 
             # Safety check: if invalid or inverted rect, clamp sensibly
