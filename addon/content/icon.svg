@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4285F4;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#9B72CB;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#D96570;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="10" fill="url(#grad)"/>
+  <!-- Antigravity floating geometric icon -->
+  <path d="M24 10 L35 30 L29 30 L24 20 L19 30 L13 30 Z" fill="#ffffff"/>
+  <circle cx="24" cy="35" r="3" fill="#ffffff"/>
+</svg>
+

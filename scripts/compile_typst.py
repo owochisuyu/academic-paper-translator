@@ -48,6 +48,17 @@ TYPST_HEADER_TEMPLATE = r'''#set page(paper: "a4", margin: (x: 20mm, y: 20mm),
 #let zhp(t) = block(breakable: true, width: 100%, inset: (y: 2pt))[#zh(t)]
 #let parallel(a, b) = table(columns: (1fr, 1fr), stroke: none, inset: 5pt,
   table.cell(breakable: true)[#en(a)], table.cell(breakable: true)[#zh(b)])
+#let sys = math.upright("sys")
+#let IF = math.upright("IF")
+#let ref = math.upright("ref")
+#let WL = math.upright("WL")
+#let NL = math.upright("NL")
+#let fix = math.upright("fix")
+#let float = math.upright("float")
+#let hard = math.upright("hard")
+#let out = math.upright("out")
+#let SR = math.italic("SR")
+#let odot = symbol("⊙")
 #let paper-table(body) = context layout(size => {
   let short = measure(body, width: size.width).height <= 70mm
   block(breakable: not short, width: 100%, body)
@@ -152,7 +163,16 @@ def _display_parts(text, item=None):
 def _content(text, item=None):
     # Whitespace immediately inside BOTH dollar delimiters makes Typst display math.
     # These parts belong inside prose; standalone equation units use display markup.
-    return '[' + ''.join(escape_typst_content(value) if kind == 'text' else '$' + value.strip() + '$' for kind, value in _display_parts(text, item)) + ']'
+    parts = []
+    for kind, value in _display_parts(text, item):
+        if kind == 'text':
+            parts.append(escape_typst_content(value))
+        else:
+            clean_val = value.strip()
+            if clean_val.startswith('{') and clean_val.endswith('}'):
+                clean_val = clean_val[1:-1].strip()
+            parts.append('$' + clean_val + '$')
+    return '[' + ''.join(parts) + ']'
 
 
 def _pair(source, target, mode, preserve=False, item=None):
@@ -173,7 +193,7 @@ def latex_to_typst(value: str) -> str:
         if value.startswith(left) and value.endswith(right):
             value = value[len(left):-len(right)].strip()
             break
-    aliases = {'times': 'times', 'cdot': 'dot', 'pm': 'plus.minus', 'le': '<=', 'leq': '<=',
+    aliases = {'odot': '⊙', 'times': 'times', 'cdot': 'dot', 'pm': 'plus.minus', 'le': '<=', 'leq': '<=',
                'ge': '>=', 'geq': '>=', 'neq': '!=', 'approx': 'approx', 'infty': 'infinity'}
     names = set('alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma tau phi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Phi Psi Omega sin cos tan log ln exp'.split())
     pos = 0

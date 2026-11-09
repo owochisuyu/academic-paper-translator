@@ -1,139 +1,62 @@
 ---
 name: academic-paper-translator
 description: >-
-  Translate complete academic papers into faithful Chinese or sentence-aligned
-  bilingual editions using the current agent. Extract PDF, Markdown, or supported
-  LaTeX sources into a traceable manifest, preserve figures and quantitative content,
-  review translations independently, and verify the actual PDF before acceptance.
+  Translate complete academic papers into publication-grade Side-by-Side Bilingual
+  (_bilingual.pdf) and Chinese Monograph (_zh.pdf) editions using Typst, with
+  automatic local Zotero lookup and attachment mounting. Preserves 100% verbatim
+  English figure captions, inline math flow, full affiliation addresses, and
+  three-line booktabs tables.
 ---
 
-# Academic paper translation
+# Academic Paper Translator (Zotero-Integrated Publication Edition)
 
-Use the current agent/model to translate meaning in context. Preserve every claim,
-condition, exception, comparison, number, citation, and formula. Natural Chinese
-syntax is welcome; summarization and invented explanations are separate work.
-The scripts organize and check the work; they do not perform semantic translation.
+Translate complete academic papers into faithful, publication-grade **Side-by-Side Bilingual (`_bilingual.pdf`)** and **Chinese Monograph (`_zh.pdf`)** editions, and automatically mount them under the corresponding local Zotero item.
 
-## Choose the route
+## Core Quality & Typesetting Rules
 
-- **PDF**: native text/geometry extraction and Typst reflow. Every image/scan region
-  has an explicit disposition; a native header never proves its body was read.
-- **Markdown**: structured headings, paragraphs, lists, pipe tables, and code.
-- **LaTeX**: use source extraction/export for supported constructs. For custom
-  macros, generated text, conditional branches or unsupported environments, compile
-  a source copy with a real TeX engine and import its PDF into the normal translation
-  workflow. Read [latex_protocol.md](references/latex_protocol.md). Compilation
-  resolves what is printed; it does not replace source/visual or translation review.
-- **Scans/complex PDFs**: prepare image-reading packets for the current vision agent,
-  independently check the transcription, then import a source overlay into a new job.
-  See [ocr_protocol.md](references/ocr_protocol.md). A complete, source-bound saved
-  MinerU result is another route; live MinerU execution is not bundled.
+1. **Zero Omission & Quantitative Fidelity**:
+   - Translate every section, paragraph, equation description, table, caption, and backmatter statement (Data Availability, Acknowledgements, Funding, Author Information, Ethics) sentence by sentence without summarizing or skipping.
+   - Preserve all numbers, tolerances (`±`), percentages, citations, and 100% of the reference list.
+2. **Mathematical Formulas (Inline vs. Display)**:
+   - **Inline math** MUST remain strictly inline inside paragraphs (`$expr$` with NO spaces inside the dollar signs and NO outer `{...}` braces around the expression, as `{...}` in Typst renders literal visible curly braces).
+   - Define multi-letter upright/italic math identifiers in the Typst preamble (e.g., `#let sys = math.upright("sys")`, `#let IF = math.upright("IF")`, `#let fix = math.upright("fix")`, `#let float = math.upright("float")`, `#let odot = symbol("⊙")`) so Typst never fails on multi-letter identifiers.
+   - **Display equations** use numbered block math (`#set math.equation(numbering: "(1)")`) matching the original paper's exact equation numbering.
+3. **Figures & Captions**:
+   - Extract high-resolution figures (supporting both standard above-caption and Springer side-caption layouts) via `scripts/extract_figures.py` or native PDF image xrefs.
+   - **100% Verbatim English Captions**: Never rewrite or paraphrase the English figure/table captions in the bilingual edition. Always pair the exact original English caption with its faithful Chinese translation.
+4. **Full Author & Affiliation Metadata**:
+   - Preserve complete author names, superscript affiliation indices (`#super[1,2]`), corresponding author asterisks (`#super[1\*]`, escaped as `\*`), email addresses (`\@` escaped), and full street addresses/postcodes.
+   - Use `#super[1]` instead of `1. ` at line starts inside `#align(center)` blocks to avoid triggering Typst's ordered list (`enum`) indentation.
+5. **Typst Escape Rules**:
+   - Always escape literal asterisks `\*` in author superscripts/footnotes, literal `\@` in emails, and never prefix table header text with `#` inside `[*{header}*]`.
 
-Read [data_contract.md](references/data_contract.md) for job/record schemas,
-[translation_protocol.md](references/translation_protocol.md) for model work,
-and [backends.md](references/backends.md) only when using source/OCR backends.
-For presentation details use [layout_templates.md](references/layout_templates.md)
-and [table_guidelines.md](references/table_guidelines.md).
+## Standard Fast Workflow
 
-## Workflow
+### Step 1: Locate Paper in Zotero & Extract Assets
+Search the local Zotero database (`E:\Document\Zotero\zotero.sqlite`) by title or DOI:
+```bash
+python "C:\Users\28048\.gemini\config\skills\academic-paper-translator\scripts\zotero_mount.py" --find "<Paper Title or DOI>"
+```
+Extract high-resolution figures (including Springer side-caption figures):
+```bash
+python "C:\Users\28048\.gemini\config\skills\academic-paper-translator\scripts\extract_figures.py" "<path-to-pdf>" --out "paper_figures"
+```
+If the paper has a DOI from Springer Nature / open HTML source, fetch the official HTML or parse the PDF to obtain 100% exact LaTeX equations, tables, and reference lists.
 
-Run scripts from this skill's directory, or invoke their absolute paths. Core
-packages are listed in `requirements.txt`; use a project environment. Runtime
-versions used in verification are recorded there, not assumed installed everywhere.
+### Step 2: Build & Compile Side-by-Side Bilingual and Chinese Monograph PDFs
+Generate the Typst source files (`_bilingual.typ` and `_zh.typ`) and Markdown exports (`_bilingual.md` and `_zh.md`), then compile via `typst.compile()`:
+- `<Title>_bilingual.pdf`: A4, `#let bipara(en, zh) = grid(columns: (1fr, 1fr), column-gutter: 18pt, ...)` with full-width centered display equations, three-line booktabs tables, and high-res figures.
+- `<Title>_zh.pdf`: Chinese academic monograph edition with `Source Han Serif SC` typography, `first-line-indent: 2em`, and Chinese captions/headers.
 
-1. **Extract a frozen job.** Choose a new directory for each extraction version.
+### Step 3: Visual Verification
+Render key pages (Page 1 title/abstract, equation pages, table/figure pages, backmatter) to PNG using `pymupdf` (`fitz`) and inspect them with `read_file` to verify:
+- No stray `{...}` braces in inline math;
+- Proper centering of affiliation lines;
+- Complete figures and three-line tables without clipping.
 
-   ```bash
-   python scripts/extract_document.py paper.pdf --job-dir runs/paper --scope full
-   ```
-
-   Inspect `document.json`, `scope_manifest.json`, `regions.jsonl`, and the original
-   pages. Full scope includes body, notes, appendices, references, captions, table
-   text, and semantic figure labels. Names, identifiers, equations, code and numeric
-   ticks may be preserved explicitly. Repeated headers/footers may be excluded with
-   provenance; body exclusions require a partial scope, not a reviewer waiver.
-
-   If extraction has gaps, fix or supplement it and create a new job. For scanned
-   regions run `prepare_ocr.py --job-dir runs/paper` and follow the OCR protocol.
-   A vision-capable agent reads the actual high-resolution images; another reviewer
-   compares its transcription with those images before `--source-overlay` import.
-   Saving an image does not translate its labels. Do not edit `source.jsonl` to erase
-   a warning.
-
-   For complex LaTeX, switch to the compiled-PDF route when static extraction cannot
-   establish the printed content. Retain source snapshots, compiler logs, the PDF
-   and every explicit compatibility adaptation. Do not translate inactive branches
-   as part of the visible paper or waive an unknown macro to make a check pass.
-
-2. **Set terminology and prepare context packets.** Write approved terms into
-   `glossary.json` where useful, then prepare work for the current agent.
-
-   ```bash
-   python scripts/prepare_translation.py --job-dir runs/paper
-   ```
-
-   Read the active manifest in `batches/translation_manifest.json`. Translate each
-   assigned ID using its packet's paragraph, neighbouring context, and approved
-   terms. Write only its assigned records to its indicated response JSONL. Copy
-   supplied hashes exactly. Unassigned context is not another translation task.
-   Run packets sequentially or with available, authorized subagents; the workflow
-   does not require an external translation API.
-
-3. **Merge and independently review.** A deterministic join is not semantic QA.
-
-   ```bash
-   python scripts/merge_translation.py --job-dir runs/paper
-   python scripts/prepare_translation.py --job-dir runs/paper --review
-   ```
-
-   An independent model invocation or reviewer reads each review packet, compares
-   source and target, assesses every required category and writes its response.
-   Do not generate PASS records in a loop without actually reviewing the content.
-   Record unresolved findings with exact source quotes. Correct affected translations,
-   re-merge, and re-review their changed hashes. Allow at most two automatic repair
-   rounds before keeping unresolved items for focused review.
-
-   ```bash
-   python scripts/merge_translation.py --job-dir runs/paper --review-batches
-   python scripts/validate_translation.py --job-dir runs/paper
-   ```
-
-   `checks/preflight.json` separates extraction, structure, facts, assets and
-   semantics. NOT_RUN/NEEDS_REVIEW is not PASS. Glossary or generation changes
-   invalidate the corresponding saved provenance. Follow the actual report; do not
-   lower coverage thresholds or replace missing translations with the English source.
-
-4. **Compile a candidate and inspect the actual output.** Mode A is the default.
-
-   ```bash
-   python scripts/compile_typst.py --job-dir runs/paper --mode A --output-stage candidate
-   python scripts/verify_output.py --job-dir runs/paper --no-promote
-   ```
-
-   Inspect all generated previews and the source figure/formula regions. Check
-   clipping, overlap, glyphs, table identity, labels and page transitions. Record
-   the actual PDF hash, reviewed page list, reviewer and findings in
-   `reviews/visual.json`, following the data contract. Then run:
-
-   ```bash
-   python scripts/verify_output.py --job-dir runs/paper
-   ```
-
-   Only a current, fully checked candidate is copied to `deliverables/`. It includes
-   PDF, Markdown, Typst source, assets and acceptance metadata. Describe the scope
-   and review methods; neither hashes nor model review prove universal correctness.
-
-## Incomplete work and compatibility
-
-`--output-stage draft` produces an explicitly marked preview and may show missing
-translations/assets. It is never an accepted deliverable. Old positional compiler
-inputs require explicit draft mode; use a canonical job for formal verification.
-
-To import old translations, first extract the same source into a job, then use
-`merge_translation.py --job-dir ... --translated old.jsonl --import-legacy`.
-Source metadata conflicts, missing/extra IDs, and malformed records fail. The import
-still needs independent review and current preflight.
-
-Keep supported source syntax and unverified features explicit. No hard-coded Zotero
-folder, automatic service upload, default replacement of the chosen model, or promise
-of publication readiness is part of this skill. Deliver to the requested directory.
+### Step 4: Automatic Zotero Local Attachment Mounting
+When Zotero is closed, automatically mount both compiled PDFs under the parent item in `zotero.sqlite`:
+```bash
+python "C:\Users\28048\.gemini\config\skills\academic-paper-translator\scripts\zotero_mount.py" --parent-id <itemID> --bilingual "<Title>_bilingual.pdf" --zh "<Title>_zh.pdf"
+```
+Also archive the `.typ` sources, `.md` files, and extracted figures folder into the original PDF's Zotero storage directory.

@@ -160,26 +160,27 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
         captions.sort(key=lambda c: (c["rect"].y0, c["rect"].x0))
 
         # 4. For each caption, compute true figure bounding box
+        claimed_graphics = set()
         for idx, cap in enumerate(captions):
             fig_id = cap["fig_id"]
             cap_rect = cap["rect"]
 
             # Determine column bounds and alignment
             is_full_width = (
-                cap_rect.width > 0.55 * page_w or
-                (cap_rect.x0 < 0.35 * page_w and cap_rect.x1 > 0.65 * page_w)
+                cap_rect.width > 0.45 * page_w or
+                (cap_rect.x0 < 0.45 * page_w and cap_rect.x1 > 0.52 * page_w)
             )
-            is_left_col = not is_full_width and cap_rect.x1 <= 0.55 * page_w
-            is_right_col = not is_full_width and cap_rect.x0 >= 0.45 * page_w
+            is_left_col = not is_full_width and ((cap_rect.x0 + cap_rect.x1) / 2.0 <= 0.50 * page_w)
+            is_right_col = not is_full_width and not is_left_col
 
             # Compute preceding caption bottom ONLY within the same column or from preceding full-width figures
             same_column_prev = []
             for c in captions:
                 if c["rect"].y1 <= cap_rect.y0:
                     c_rect = c["rect"]
-                    c_full = (c_rect.width > 0.55 * page_w or (c_rect.x0 < 0.35 * page_w and c_rect.x1 > 0.65 * page_w))
-                    c_left = not c_full and c_rect.x1 <= 0.55 * page_w
-                    c_right = not c_full and c_rect.x0 >= 0.45 * page_w
+                    c_full = (c_rect.width > 0.45 * page_w or (c_rect.x0 < 0.45 * page_w and c_rect.x1 > 0.52 * page_w))
+                    c_left = not c_full and ((c_rect.x0 + c_rect.x1) / 2.0 <= 0.50 * page_w)
+                    c_right = not c_full and not c_left
 
                     if is_full_width or c_full:
                         same_column_prev.append(c_rect.y1)
@@ -221,7 +222,9 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
 
             # Filter graphics belonging to this figure (located above the caption)
             matched_graphics = []
-            for gr in all_graphics:
+            for gr_idx, gr in enumerate(all_graphics):
+                if gr_idx in claimed_graphics:
+                    continue
                 # Vertical check: must be above caption top, and below previous caption
                 if gr.y1 > cap_rect.y0 + 8.0:
                     continue
@@ -237,11 +240,38 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
                 if is_full_width:
                     if overlap_x > 30.0 or cap_overlap > 30.0:
                         matched_graphics.append(gr)
+                        claimed_graphics.add(gr_idx)
                 else:
                     # In single-column, ensure center or substantial area falls inside column
                     gr_center_x = (gr.x0 + gr.x1) / 2.0
                     if col_x0 <= gr_center_x <= col_x1 or cap_overlap > 20.0:
                         matched_graphics.append(gr)
+                        claimed_graphics.add(gr_idx)
+
+            # Check if above-caption matched_graphics is only a thin rule/separator (< 18pt height)
+            is_side_caption = False
+            if matched_graphics:
+                tmp_rect = pymupdf.Rect(matched_graphics[0])
+                for gr in matched_graphics[1:]:
+                    tmp_rect.include_rect(gr)
+                if tmp_rect.height < 18.0:
+                    matched_graphics = []
+
+            # Springer side-caption support: caption in narrow left column, figure to the right
+            if not matched_graphics and is_left_col:
+                side_candidates = []
+                for gr_idx, gr in enumerate(all_graphics):
+                    if gr_idx in claimed_graphics:
+                        continue
+                    if gr.height < 18.0 and gr.width > 40.0:
+                        continue
+                    if gr.x0 >= cap_rect.x1 - 15.0 and abs(gr.y0 - cap_rect.y0) < 60.0:
+                        side_candidates.append((gr_idx, gr))
+                if side_candidates:
+                    is_side_caption = True
+                    for gr_idx, gr in side_candidates:
+                        matched_graphics.append(gr)
+                        claimed_graphics.add(gr_idx)
 
             # Build figure bounding box
             if matched_graphics:
@@ -297,9 +327,13 @@ def extract_figures(pdf_path: str, output_dir: str = "paper_figures", dpi: int =
             x0 = max(0.0, fig_rect.x0 - padding)
             y0 = max(0.0, max(prev_cap_bottom, fig_rect.y0 - padding))
             x1 = min(page_w, fig_rect.x1 + padding)
-            if strict_column:
+            if strict_column and not is_side_caption:
                 x0, x1 = max(x0, col_x0), min(x1, col_x1)
-            y1 = min(cap_rect.y0 - 1.5, fig_rect.y1 + padding)
+            if is_side_caption:
+                y0 = max(0.0, fig_rect.y0 - padding)
+                y1 = min(page_h, fig_rect.y1 + padding)
+            else:
+                y1 = min(cap_rect.y0 - 1.5, fig_rect.y1 + padding)
 
             # Safety check: if invalid or inverted rect, clamp sensibly
             if y1 <= y0 + 10.0:

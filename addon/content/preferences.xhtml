@@ -1,0 +1,120 @@
+<vbox id="zotero-prefpane-antigravity"
+      xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+      xmlns:html="http://www.w3.org/1999/xhtml"
+      style="padding: 16px; overflow-y: auto;">
+
+  <!-- Section 1: Engine & Model -->
+  <groupbox style="margin-bottom: 16px; padding: 12px; border-radius: 6px;">
+    <label><html:h3 style="margin: 0 0 10px 0; color: #1a73e8;">🚀 Antigravity 核心引擎与模型配置</html:h3></label>
+
+    <hbox align="center" style="margin-bottom: 8px;">
+      <label value="工作模式:" style="width: 110px; font-weight: 500;"/>
+      <html:select id="antigravity-pref-engine" preference="extensions.antigravity.engine" style="min-width: 320px; padding: 4px; border-radius: 4px; border: 1px solid #ccc;">
+        <html:option value="direct">免 Server 直连模式 (推荐：直接调用 agy.exe，零后台，永不断连)</html:option>
+        <html:option value="server">Python Bridge 桥接模式 (需本地运行 server.py)</html:option>
+      </html:select>
+    </hbox>
+
+    <hbox align="center" style="margin-bottom: 8px;">
+      <label value="CLI 路径:" style="width: 110px; font-weight: 500;"/>
+      <html:input id="antigravity-pref-agy-path" preference="extensions.antigravity.agy_path" type="text" placeholder="留空则自动检测 ~/.gemini/bin/agy.exe" style="width: 280px; padding: 4px; border-radius: 4px; border: 1px solid #ccc;"/>
+      <html:button id="antigravity-btn-detect-agy" style="margin-left: 8px; padding: 4px 10px; cursor: pointer; border-radius: 4px;">
+        🔍 自动检测
+      </html:button>
+      <label id="antigravity-agy-status" value="" style="margin-left: 8px; font-size: 11px; color: #137333;"/>
+    </hbox>
+
+    <hbox align="center" style="margin-bottom: 8px;">
+      <label value="推理模型:" style="width: 110px; font-weight: 500;"/>
+      <html:select id="antigravity-pref-model" preference="extensions.antigravity.model" style="min-width: 320px; padding: 4px; border-radius: 4px; border: 1px solid #ccc;">
+        <html:option value="gemini-3.8-flash-low">Gemini 3.8 Flash (Low) - ⚡ 极速出字 (推荐划词翻译)</html:option>
+        <html:option value="gemini-3.8-flash-medium">Gemini 3.8 Flash (Medium) - 均衡模式</html:option>
+        <html:option value="gemini-3.8-flash-high">Gemini 3.8 Flash (High) - 深度思考 (出版级精翻)</html:option>
+        <html:option value="gemini-3.1-pro-high">Gemini 3.1 Pro (High) - 💎 深度推理与公式解析</html:option>
+        <html:option value="gemini-3.1-pro-low">Gemini 3.1 Pro (Low) - 高效专业推理</html:option>
+      </html:select>
+    </hbox>
+
+    <hbox id="antigravity-server-row" align="center" style="margin-bottom: 8px;">
+      <label value="Bridge 端口:" style="width: 110px; font-weight: 500;"/>
+      <html:input id="antigravity-pref-port" preference="extensions.antigravity.port" type="number" value="28119" style="width: 90px; padding: 4px; border-radius: 4px; border: 1px solid #ccc;"/>
+      <html:button id="antigravity-btn-test-conn" style="margin-left: 10px; padding: 4px 10px; cursor: pointer; border-radius: 4px;">
+        测试连接
+      </html:button>
+      <label id="antigravity-conn-status" value="未检测" style="margin-left: 10px; font-weight: bold; color: #666;"/>
+    </hbox>
+  </groupbox>
+
+  <!-- Section 2: Reader Interaction -->
+  <groupbox style="margin-bottom: 16px; padding: 12px; border-radius: 6px;">
+    <label><html:h3 style="margin: 0 0 10px 0; color: #1a73e8;">📖 PDF 阅读器划词翻译与词典设置</html:h3></label>
+    <checkbox id="antigravity-pref-autotranslate" preference="extensions.antigravity.autotranslate" label="划选文本时自动呼出翻译浮窗并开启流式打字" checked="true" style="margin-bottom: 6px;"/>
+    <checkbox id="antigravity-pref-dict-words" preference="extensions.antigravity.dict_words" label="划选单个英文单词/短语时启用牛津词典秒查 (&lt;100ms 秒级出音标与双解释义)" checked="true" style="margin-bottom: 6px;"/>
+    <label style="color: #666; font-size: 11px; margin-left: 22px;">
+      遇到单词时自动秒查牛津词典，并支持一键「🤖 AI 解析」切换大模型精读；长句和段落自动使用 Gemini 模型精翻。
+    </label>
+  </groupbox>
+
+  <!-- Section 3: Academic Translation Prompt -->
+  <groupbox style="margin-bottom: 16px; padding: 12px; border-radius: 6px;">
+    <hbox align="center" style="justify-content: space-between; margin-bottom: 6px;">
+      <label><html:h3 style="margin: 0; color: #1a73e8;">✍️ 出版级学术翻译专家 Prompt</html:h3></label>
+      <html:button id="antigravity-btn-reset-prompt" style="padding: 2px 8px; font-size: 11px; cursor: pointer;">
+        恢复默认学术提示词
+      </html:button>
+    </hbox>
+    <label style="color: #666; font-size: 11px; margin-bottom: 8px;">
+      内置策略：定量结果表格保持原文，定性描述表格深度翻译；保留 (Author, Year) 与 [1] 引用；LaTeX/KaTeX 公式严密还原；剔除文末 References。
+    </label>
+    <html:textarea id="antigravity-pref-prompt" preference="extensions.antigravity.prompt" rows="10" style="width: 100%; box-sizing: border-box; font-family: monospace; font-size: 12px; padding: 8px; border-radius: 4px; border: 1px solid #ccc; line-height: 1.4;"/>
+  </groupbox>
+
+  <!-- Section 4: Usage & Token Statistics -->
+  <groupbox style="padding: 12px; border-radius: 6px;">
+    <hbox align="center" style="justify-content: space-between; margin-bottom: 8px;">
+      <label><html:h3 style="margin: 0; color: #1a73e8;">📊 翻译用量与 Token 统计</html:h3></label>
+      <hbox align="center">
+        <html:button id="antigravity-btn-refresh-stats" style="padding: 3px 8px; font-size: 11px; cursor: pointer; margin-right: 6px; border-radius: 4px;">
+          🔄 刷新统计
+        </html:button>
+        <html:button id="antigravity-btn-reset-stats" style="padding: 3px 8px; font-size: 11px; cursor: pointer; border-radius: 4px; color: #c5221f;">
+          🗑️ 清空统计
+        </html:button>
+      </hbox>
+    </hbox>
+    <label style="color: #666; font-size: 11px; margin-bottom: 12px;">
+      实时统计划词翻译、牛津词典秒查及全文翻译调用量与 Token 预估消耗（基于学术英汉混合语料 ~0.38 Token/字符基准换算）。
+    </label>
+
+    <html:div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+      <!-- Card 1: 划词与查词 -->
+      <html:div style="background: rgba(26, 115, 232, 0.06); border: 1px solid rgba(26, 115, 232, 0.2); border-radius: 6px; padding: 10px;">
+        <html:div style="font-weight: 600; font-size: 12px; color: #1a73e8; margin-bottom: 6px;">⚡ 划词与词典</html:div>
+        <html:div style="font-size: 11px; color: #555; margin-bottom: 4px;">划词大模型翻译: <html:b id="stat-selection-calls" style="color: #202124;">0</html:b> 次</html:div>
+        <html:div style="font-size: 11px; color: #555;">牛津词典秒查: <html:b id="stat-dict-calls" style="color: #202124;">0</html:b> 次</html:div>
+      </html:div>
+
+      <!-- Card 2: 全文翻译 -->
+      <html:div style="background: rgba(52, 168, 83, 0.06); border: 1px solid rgba(52, 168, 83, 0.2); border-radius: 6px; padding: 10px;">
+        <html:div style="font-weight: 600; font-size: 12px; color: #1e8e3e; margin-bottom: 6px;">📑 出版级全文翻译</html:div>
+        <html:div style="font-size: 11px; color: #555; margin-bottom: 4px;">全文翻译篇数: <html:b id="stat-fulltext-calls" style="color: #202124;">0</html:b> 篇</html:div>
+        <html:div style="font-size: 11px; color: #555;">累计翻译章节: <html:b id="stat-fulltext-sections" style="color: #202124;">0</html:b> 节</html:div>
+      </html:div>
+
+      <!-- Card 3: 字符与Token -->
+      <html:div style="background: rgba(234, 134, 0, 0.06); border: 1px solid rgba(234, 134, 0, 0.2); border-radius: 6px; padding: 10px;">
+        <html:div style="font-weight: 600; font-size: 12px; color: #ea8600; margin-bottom: 6px;">🔤 吞吐与 Token 消耗</html:div>
+        <html:div style="font-size: 11px; color: #555; margin-bottom: 4px;">累计翻译字符: <html:b id="stat-total-chars" style="color: #202124;">0</html:b></html:div>
+        <html:div style="font-size: 11px; color: #555;">预估 Token: <html:b id="stat-estimated-tokens" style="color: #202124;">0</html:b></html:div>
+      </html:div>
+    </html:div>
+
+    <!-- Bottom summary banner -->
+    <hbox align="center" style="background: rgba(0, 0, 0, 0.03); border-radius: 4px; padding: 6px 10px; justify-content: space-between;">
+      <label id="stat-today-summary" value="📅 今日用量: 0 次调用 / 0 字符 (约 0 Tokens)" style="font-size: 11px; color: #666;"/>
+      <label id="stat-model-breakdown" value="主力模型: Gemini 3.8 Flash" style="font-size: 11px; color: #888;"/>
+    </hbox>
+  </groupbox>
+
+</vbox>
+
